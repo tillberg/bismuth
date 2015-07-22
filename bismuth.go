@@ -1,11 +1,14 @@
 package bismuth
 
 import (
+    "bytes"
+    "errors"
     "fmt"
     "io"
     "net"
     "os"
     "os/exec"
+    "strings"
     "sync"
     "golang.org/x/crypto/ssh"
     "golang.org/x/crypto/ssh/agent"
@@ -60,11 +63,16 @@ type ExecContext struct {
     username   string
     hostname   string
     port       int
-    client     *ssh.Client
+
+    sshClient  *ssh.Client
+    connected  bool
 
     numRunning int
     numWaiting int
     poolDone   chan bool
+
+    uname      string
+    home       string
 }
 
 func (ctx *ExecContext) Init() {
@@ -81,15 +89,21 @@ func (ctx *ExecContext) lock() { ctx.mutex.Lock() }
 func (ctx *ExecContext) unlock() { ctx.mutex.Unlock() }
 
 func (ctx *ExecContext) close() {
-    if ctx.client != nil {
-        ctx.client.Close()
-        ctx.client = nil
+    if ctx.sshClient != nil {
+        ctx.sshClient.Close()
+        ctx.sshClient = nil
     }
 }
-func (ctx *ExecContext) getClient() (*ssh.Client, error) {
-    if ctx.client == nil {
+
+func (ctx *ExecContext) connect() error {
+    ctx.lock()
+    defer ctx.unlock()
+    if ctx.connected {
+        return errors.New("Already connected")
+    }
+    if ctx.hostname != "" {
         agentConn, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
-        if err != nil { return nil, err }
+        if err != nil { return err }
         defer agentConn.Close()
         ag := agent.NewClient(agentConn)
         auths := []ssh.AuthMethod{ssh.PublicKeysCallback(ag.Signers)}
@@ -97,15 +111,76 @@ func (ctx *ExecContext) getClient() (*ssh.Client, error) {
             User: ctx.username,
             Auth: auths,
         }
-        client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", ctx.hostname, ctx.port), config)
-        if err != nil { return nil, err }
-        ctx.client = client
+        ctx.sshClient, err = ssh.Dial("tcp", fmt.Sprintf("%s:%d", ctx.hostname, ctx.port), config)
+        if err != nil { return err }
     }
-    return ctx.client, nil
+    ctx.connected = true
+    return nil
+}
+
+func (ctx *ExecContext) Connect() error {
+    err := ctx.connect()
+    if err != nil { return err }
+
+    done := make(chan error)
+    numTasks := 0
+    doTask := func(fn func()) {
+        numTasks++
+        go fn()
+    }
+    doTask(func() {
+        stdout, _, err := ctx.Run("uname")
+        if err != nil {
+            done<-err
+        } else {
+            ctx.uname = strings.TrimSpace(string(stdout))
+            done<-nil
+        }
+    })
+    doTask(func() {
+        stdout, _, err := ctx.Run("echo $HOME")
+        if err != nil {
+            done<-err
+        } else {
+            ctx.home = strings.TrimSpace(string(stdout))
+            done<-nil
+        }
+    })
+    for i := 0; i < numTasks; i++ {
+        err := <-done
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+func (ctx *ExecContext) assertConnected() error {
+    if !ctx.connected {
+        return errors.New("Not connected. Call Connect first.")
+    }
+    return nil
+}
+
+func (ctx *ExecContext) _makeSession() (Session, error) {
+    var session Session
+    if ctx.hostname != "" {
+        sshSession, err := ctx.sshClient.NewSession()
+        if err != nil { return nil, err }
+        session = &SshSession{sshSession}
+    } else {
+        session = &LocalSession{}
+    }
+    return session, nil
 }
 
 func (ctx *ExecContext) makeSession() (Session, error) {
     ctx.lock()
+    defer ctx.unlock()
+    err := ctx.assertConnected()
+    if err != nil {
+        return nil, err
+    }
     if ctx.numRunning < maxSessions {
         ctx.numRunning++
     } else {
@@ -114,18 +189,7 @@ func (ctx *ExecContext) makeSession() (Session, error) {
         <-ctx.poolDone
         ctx.lock()
     }
-    var session Session
-    if ctx.hostname != "" {
-        client, err := ctx.getClient()
-        if err != nil { return nil, err }
-        sshSession, err := client.NewSession()
-        if err != nil { return nil, err }
-        session = &SshSession{sshSession}
-    } else {
-        session = &LocalSession{}
-    }
-    ctx.unlock()
-    return session, nil
+    return ctx._makeSession()
 }
 
 func (ctx *ExecContext) closeSession(session Session) {
@@ -182,8 +246,45 @@ func (ctx *ExecContext) RunShell(s string) error {
     return err
 }
 
+func (ctx *ExecContext) Run(s string) (stdout []byte, stderr []byte, err error) {
+    session, err := ctx.makeSession()
+    if err != nil { return nil, nil, err }
+    var bufOut bytes.Buffer
+    var bufErr bytes.Buffer
+    session.SetStdout(&bufOut)
+    session.SetStderr(&bufErr)
+    err = session.Start(s)
+    if err != nil { return nil, nil, err }
+    err = session.Wait()
+    if err != nil { return nil, nil, err }
+    ctx.closeSession(session)
+    return bufOut.Bytes(), bufErr.Bytes(), nil
+}
+
 func (ctx *ExecContext) Close() {
     ctx.mutex.Lock()
     defer ctx.mutex.Unlock()
     ctx.close()
+}
+
+func (ctx *ExecContext) Uname() string {
+    ctx.mutex.Lock()
+    defer ctx.mutex.Unlock()
+    err := ctx.assertConnected()
+    if err != nil {
+        panic(err)
+    }
+    return ctx.uname
+}
+
+func (ctx *ExecContext) IsWindows() bool {
+    return ctx.Uname() == "Windows" // XXX this won't actually work
+}
+
+func (ctx *ExecContext) IsDarwin() bool {
+    return ctx.Uname() == "Darwin"
+}
+
+func (ctx *ExecContext) IsLinux() bool {
+    return ctx.Uname() == "Linux"
 }
