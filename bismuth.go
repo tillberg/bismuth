@@ -2,13 +2,56 @@ package bismuth
 
 import (
     "fmt"
+    "io"
     "net"
     "os"
+    "os/exec"
     "sync"
     "golang.org/x/crypto/ssh"
     "golang.org/x/crypto/ssh/agent"
     "github.com/tillberg/ansi-log"
 )
+
+type Session interface {
+    Close() error
+    Start(cmd string) error
+    Wait() error
+    SetStdout(writer io.Writer)
+    SetStderr(writer io.Writer)
+}
+
+// Extend ssh.Session so that it implements the Session interface
+type SshSession struct {
+    *ssh.Session
+}
+func (s *SshSession) SetStdout(writer io.Writer) { s.Stdout = writer }
+func (s *SshSession) SetStderr(writer io.Writer) { s.Stderr = writer }
+
+type LocalSession struct {
+    cmd *exec.Cmd
+    Stdout io.Writer
+    Stderr io.Writer
+}
+
+func (s *LocalSession) Start(cmd string) error {
+    bin, err := exec.LookPath("sh")
+    if err != nil { return err }
+    s.cmd = exec.Command(bin, "-c", cmd)
+    s.cmd.Stdout = s.Stdout
+    s.cmd.Stderr = s.Stderr
+    return s.cmd.Start()
+}
+
+func (s *LocalSession) Wait() error {
+    return s.cmd.Wait()
+}
+
+func (s *LocalSession) Close() error {
+    return nil
+}
+
+func (s *LocalSession) SetStdout(writer io.Writer) { s.Stdout = writer }
+func (s *LocalSession) SetStderr(writer io.Writer) { s.Stderr = writer }
 
 const maxSessions = 5
 
@@ -61,7 +104,7 @@ func (ctx *ExecContext) getClient() (*ssh.Client, error) {
     return ctx.client, nil
 }
 
-func (ctx *ExecContext) makeSession() (*ssh.Session, error) {
+func (ctx *ExecContext) makeSession() (Session, error) {
     ctx.lock()
     if ctx.numRunning < maxSessions {
         ctx.numRunning++
@@ -71,15 +114,21 @@ func (ctx *ExecContext) makeSession() (*ssh.Session, error) {
         <-ctx.poolDone
         ctx.lock()
     }
-    client, err := ctx.getClient()
-    if err != nil { return nil, err }
-    session, err := client.NewSession()
-    if err != nil { return nil, err }
+    var session Session
+    if ctx.hostname != "" {
+        client, err := ctx.getClient()
+        if err != nil { return nil, err }
+        sshSession, err := client.NewSession()
+        if err != nil { return nil, err }
+        session = &SshSession{sshSession}
+    } else {
+        session = &LocalSession{}
+    }
     ctx.unlock()
     return session, nil
 }
 
-func (ctx *ExecContext) closeSession(session *ssh.Session) {
+func (ctx *ExecContext) closeSession(session Session) {
     session.Close()
     ctx.lock()
     ctx.numRunning--
@@ -123,9 +172,12 @@ func (ctx *ExecContext) RunShell(s string) error {
     defer stdout.Close()
     stderr := log.New(os.Stderr, "[err] ", 0)
     defer stderr.Close()
-    session.Stdout = stdout
-    session.Stderr = stderr
-    err = session.Run(s)
+    session.SetStdout(stdout)
+    session.SetStderr(stderr)
+    err = session.Start(s)
+    if err != nil { return err }
+    err = session.Wait()
+    if err != nil { return err }
     ctx.closeSession(session)
     return err
 }
