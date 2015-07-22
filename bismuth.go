@@ -2,11 +2,11 @@ package bismuth
 
 import (
     "fmt"
-    "io/ioutil"
+    "net"
     "os"
-    "os/user"
     "sync"
     "golang.org/x/crypto/ssh"
+    "golang.org/x/crypto/ssh/agent"
     "github.com/tillberg/ansi-log"
 )
 
@@ -43,35 +43,20 @@ func (ctx *ExecContext) close() {
         ctx.client = nil
     }
 }
-
-func getKeyFile() (key ssh.Signer, err error){
-    usr, _ := user.Current()
-    file := usr.HomeDir + "/.ssh/id_rsa"
-    buf, err := ioutil.ReadFile(file)
-    if err != nil {
-        return
-    }
-    key, err = ssh.ParsePrivateKey(buf)
-    if err != nil {
-        return
-    }
-    return
-}
-
 func (ctx *ExecContext) getClient() (*ssh.Client, error) {
     if ctx.client == nil {
-        key, err := getKeyFile()
-        if err != nil { panic(err) }
+        agentConn, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
+        if err != nil { return nil, err }
+        defer agentConn.Close()
+        ag := agent.NewClient(agentConn)
+        auths := []ssh.AuthMethod{ssh.PublicKeysCallback(ag.Signers)}
         config := &ssh.ClientConfig{
             User: ctx.username,
-            Auth: []ssh.AuthMethod{
-                ssh.PublicKeys(key),
-            },
+            Auth: auths,
         }
-        // Dial your ssh server.
-        ctx.client, err = ssh.Dial("tcp", fmt.Sprintf("%s:%d", ctx.hostname, ctx.port), config)
+        client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", ctx.hostname, ctx.port), config)
         if err != nil { return nil, err }
-        // defer ctx.client.Close()
+        ctx.client = client
     }
     return ctx.client, nil
 }
@@ -150,4 +135,3 @@ func (ctx *ExecContext) Close() {
     defer ctx.mutex.Unlock()
     ctx.close()
 }
-
