@@ -20,44 +20,68 @@ import (
 
 type Session interface {
     Close() error
-    Start(cmd string) error
+    SetCwd(cwd string)
+    SetCmdShell(cmd string)
+    SetCmdArgs(args ...string)
+    Start() error
     Wait() error
+    StdinPipe() (io.WriteCloser, error)
+    StdoutPipe() (io.Reader, error)
     SetStdout(writer io.Writer)
     SetStderr(writer io.Writer)
+}
+
+func getShellCommand(cwd string, cmd string) string {
+    if cwd != "" {
+        cmd = fmt.Sprintf("%s && %s", shellquote.Join("cd", cwd), cmd)
+    }
+    return cmd
 }
 
 // Extend ssh.Session so that it implements the Session interface
 type SshSession struct {
     *ssh.Session
+    cwd      string
+    shellCmd string
+}
+func NewSshSession(_session *ssh.Session) *SshSession {
+    s := &SshSession{}
+    s.Session = _session
+    return s
 }
 func (s *SshSession) SetStdout(writer io.Writer) { s.Stdout = writer }
 func (s *SshSession) SetStderr(writer io.Writer) { s.Stderr = writer }
+func (s *SshSession) SetCwd(cwd string) { s.cwd = cwd }
+func (s *SshSession) SetCmdShell(cmd string) { s.shellCmd = cmd }
+func (s *SshSession) SetCmdArgs(args ...string) { s.SetCmdShell(shellquote.Join(args...)) }
+func (s *SshSession) Start() error { return s.Session.Start(getShellCommand(s.cwd, s.shellCmd)) }
 
 type LocalSession struct {
-    cmd *exec.Cmd
-    Stdout io.Writer
-    Stderr io.Writer
+    *exec.Cmd
+    cwd      string
+    shellCmd string
 }
-
-func (s *LocalSession) Start(cmd string) error {
-    bin, err := exec.LookPath("sh")
-    if err != nil { return err }
-    s.cmd = exec.Command(bin, "-c", cmd)
-    s.cmd.Stdout = s.Stdout
-    s.cmd.Stderr = s.Stderr
-    return s.cmd.Start()
+func NewLocalSession() *LocalSession {
+    s := &LocalSession{}
+    s.Cmd = exec.Command("sh", "tbd")
+    return s
 }
-
-func (s *LocalSession) Wait() error {
-    return s.cmd.Wait()
+func (s *LocalSession) SetCwd(cwd string) { s.cwd = cwd }
+func (s *LocalSession) SetCmdShell(cmd string) { s.shellCmd = cmd }
+func (s *LocalSession) SetCmdArgs(args ...string) { s.SetCmdShell(shellquote.Join(args...)) }
+func (s *LocalSession) Start() error {
+    s.Args = []string{"sh", "-c", getShellCommand(s.cwd, s.shellCmd)}
+    return s.Cmd.Start()
 }
-
-func (s *LocalSession) Close() error {
-    return nil
-}
-
+func (s *LocalSession) Close() error { return nil }
 func (s *LocalSession) SetStdout(writer io.Writer) { s.Stdout = writer }
 func (s *LocalSession) SetStderr(writer io.Writer) { s.Stderr = writer }
+func (s *LocalSession) StdoutPipe() (io.Reader, error) {
+    readCloser, err := s.Cmd.StdoutPipe()
+    if err != nil { return nil, err }
+    reader := readCloser.(io.Reader)
+    return reader, nil
+}
 
 const maxSessions = 5
 
@@ -193,14 +217,14 @@ func (ctx *ExecContext) _makeSession() (Session, error) {
     if ctx.hostname != "" {
         sshSession, err := ctx.sshClient.NewSession()
         if err != nil { return nil, err }
-        session = &SshSession{sshSession}
+        session = NewSshSession(sshSession)
     } else {
-        session = &LocalSession{}
+        session = NewLocalSession()
     }
     return session, nil
 }
 
-func (ctx *ExecContext) makeSession() (Session, error) {
+func (ctx *ExecContext) MakeSession() (Session, error) {
     ctx.lock()
     defer ctx.unlock()
     err := ctx.assertConnected()
@@ -292,8 +316,8 @@ func (ctx *ExecContext) Logger() *log.Logger {
     return ctx.logger
 }
 
-func (ctx *ExecContext) startCmdAndWait(session Session, s string) (int, error) {
-    err := session.Start(s)
+func (ctx *ExecContext) StartCmdAndWait(session Session) (int, error) {
+    err := session.Start()
     if err != nil { return -1, err }
     defer ctx.closeSession(session)
     err = session.Wait()
@@ -310,65 +334,194 @@ func (ctx *ExecContext) startCmdAndWait(session Session, s string) (int, error) 
     return 0, nil
 }
 
-func (ctx *ExecContext) QuoteShell(suffix string, s string) error {
-    session, err := ctx.makeSession()
-    if err != nil { return err }
-    stdout := ctx.newLogger(suffix)
-    defer stdout.Close()
-    stderr := ctx.newLogger(suffix)
-    defer stderr.Close()
-    session.SetStdout(stdout)
-    session.SetStderr(stderr)
-    _, err = ctx.startCmdAndWait(session, s)
+type SessionSetupFn func(session Session, ready chan bool, done chan bool)
+
+func (ctx *ExecContext) ExecSession(setupFns ...SessionSetupFn) (int, error) {
+    session, err := ctx.MakeSession()
+    if err != nil { return -1, err }
+    ready := make(chan bool)
+    done := make(chan bool)
+    for _, setupFn := range setupFns {
+        go setupFn(session, ready, done)
+        <-ready
+    }
+    retCode, err := ctx.StartCmdAndWait(session)
+    for _, _ = range setupFns {
+        done<-true
+    }
+    return retCode, err
+}
+
+func (ctx *ExecContext) SessionQuote(suffix string) SessionSetupFn {
+    fn := func(session Session, ready chan bool, done chan bool) {
+        stdout := ctx.newLogger(suffix)
+        stderr := ctx.newLogger(suffix)
+        defer stdout.Close()
+        defer stderr.Close()
+        session.SetStdout(stdout)
+        session.SetStderr(stderr)
+        ready<-true
+        <-done
+    }
+    return fn
+}
+
+func SessionShell(cmd string) SessionSetupFn {
+    fn := func(session Session, ready chan bool, done chan bool) {
+        session.SetCmdShell(cmd)
+        ready<-true
+        <-done
+    }
+    return fn
+}
+
+func SessionArgs(args ...string) SessionSetupFn {
+    fn := func(session Session, ready chan bool, done chan bool) {
+        session.SetCmdArgs(args...)
+        ready<-true
+        <-done
+    }
+    return fn
+}
+
+func SessionCwd(cwd string) SessionSetupFn {
+    fn := func(session Session, ready chan bool, done chan bool) {
+        session.SetCwd(cwd)
+        ready<-true
+        <-done
+    }
+    return fn
+}
+
+func SessionBuffer() (SessionSetupFn, chan []byte) {
+    bufChan := make(chan []byte)
+    fn := func(session Session, ready chan bool, done chan bool) {
+        var bufOut bytes.Buffer
+        var bufErr bytes.Buffer
+        session.SetStdout(&bufOut)
+        session.SetStderr(&bufErr)
+        ready<-true
+        <-done
+        bufChan<-bufOut.Bytes()
+        bufChan<-bufErr.Bytes()
+    }
+    return fn, bufChan
+}
+
+func (ctx *ExecContext) QuoteShell(suffix string, s string) (err error) {
+    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionShell(s))
     return err
 }
 
-func (ctx ExecContext) getShellCommand(cwd string, args []string) string {
-    cmd := shellquote.Join(args...)
-    if cwd != "" {
-        cmd = fmt.Sprintf("%s && %s", shellquote.Join("cd", ctx.AbsPath(cwd)), cmd)
-    }
-    return cmd
+func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) (err error) {
+    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionCwd(cwd), SessionArgs(args...))
+    return err
 }
 
-func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) error {
-    return ctx.QuoteShell(suffix, ctx.getShellCommand(cwd, args))
-}
-
-func (ctx *ExecContext) Quote(suffix string, args ...string) error {
-    return ctx.QuoteShell(suffix, ctx.getShellCommand("", args))
+func (ctx *ExecContext) Quote(suffix string, args ...string) (err error) {
+    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionArgs(args...))
+    return err
 }
 
 func (ctx *ExecContext) RunShell(s string) (stdout []byte, stderr []byte, retCode int, err error) {
-    session, err := ctx.makeSession()
-    if err != nil { return nil, nil, -1, err }
-    var bufOut bytes.Buffer
-    var bufErr bytes.Buffer
-    session.SetStdout(&bufOut)
-    session.SetStderr(&bufErr)
-    retCode, err = ctx.startCmdAndWait(session, s)
-    return bufOut.Bytes(), bufErr.Bytes(), retCode, nil
+    bufSetup, bufChan := SessionBuffer()
+    retCode, err = ctx.ExecSession(bufSetup, SessionShell(s))
+    stdout = <-bufChan
+    stderr = <-bufChan
+    return stdout, stderr, retCode, nil
 }
 
 func (ctx *ExecContext) RunCwd(cwd string, args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
-    return ctx.RunShell(ctx.getShellCommand(cwd, args))
+    bufSetup, bufChan := SessionBuffer()
+    retCode, err = ctx.ExecSession(bufSetup, SessionCwd(cwd), SessionArgs(args...))
+    stdout = <-bufChan
+    stderr = <-bufChan
+    return stdout, stderr, retCode, nil
 }
 
 func (ctx *ExecContext) Run(args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
-    return ctx.RunShell(ctx.getShellCommand("", args))
+    bufSetup, bufChan := SessionBuffer()
+    retCode, err = ctx.ExecSession(bufSetup, SessionArgs(args...))
+    stdout = <-bufChan
+    stderr = <-bufChan
+    return stdout, stderr, retCode, nil
 }
 
 func (ctx *ExecContext) OutputShell(s string) (stdout string, err error) {
-    _stdout, _, _, err := ctx.RunShell(s)
-    return strings.TrimSpace(string(_stdout)), err
+    bufSetup, bufChan := SessionBuffer()
+    _, err = ctx.ExecSession(bufSetup, SessionShell(s))
+    stdout = strings.TrimSpace(string(<-bufChan))
+    <-bufChan
+    return stdout, err
 }
 
 func (ctx *ExecContext) OutputCwd(cwd string, args ...string) (stdout string, err error) {
-    return ctx.OutputShell(ctx.getShellCommand(cwd, args))
+    bufSetup, bufChan := SessionBuffer()
+    _, err = ctx.ExecSession(bufSetup, SessionCwd(cwd), SessionArgs(args...))
+    stdout = strings.TrimSpace(string(<-bufChan))
+    <-bufChan
+    return stdout, err
 }
 
 func (ctx *ExecContext) Output(args ...string) (stdout string, err error) {
-    return ctx.OutputShell(ctx.getShellCommand("", args))
+    bufSetup, bufChan := SessionBuffer()
+    _, err = ctx.ExecSession(bufSetup, SessionArgs(args...))
+    stdout = strings.TrimSpace(string(<-bufChan))
+    <-bufChan
+    return stdout, err
+}
+
+// This is super-duper slow because SCP is super-duper slow. But it works, at least some of the time.
+func (ctx *ExecContext) UploadRecursive(srcPath string, destContext *ExecContext, destPath string) error {
+    status := ctx.NewLogger("")
+    status.Printf("Uploading %s to dest %s\n", srcPath, destPath)
+    srcSession, err := ctx.MakeSession()
+    if err != nil { return err }
+    destSession, err := destContext.MakeSession()
+    if err != nil { return err }
+
+    srcStderr := ctx.NewLogger("scp-src")
+    defer srcStderr.Close()
+    srcSession.SetStderr(srcStderr)
+
+    destStderr := destContext.NewLogger("scp-dest")
+    defer destStderr.Close()
+    destSession.SetStderr(destStderr)
+
+    srcStdin, err := srcSession.StdinPipe()
+    destStdin, err := destSession.StdinPipe()
+
+    // Uncomment to watch:
+    // srcStdoutLog := ctx.NewLogger("scp-src/out")
+    // defer srcStdoutLog.Close()
+    // destStdoutLog := ctx.NewLogger("scp-dest/out")
+    // defer destStdoutLog.Close()
+    // srcSession.SetStdout(io.MultiWriter(destStdin, srcStdoutLog))
+    // destSession.SetStdout(io.MultiWriter(srcStdin, destStdoutLog))
+
+    srcSession.SetStdout(destStdin)
+    destSession.SetStdout(srcStdin)
+
+    done := make(chan error)
+    go func() {
+        status.Printf("Starting source scp %s\n", ctx.AbsPath(srcPath))
+        srcSession.SetCmdArgs("scp", "-rfp", ctx.AbsPath(srcPath))
+        retCode, err := ctx.StartCmdAndWait(srcSession)
+        status.Printf("Src scp exited with %d and %#v\n", retCode, err)
+        done<-err
+    }()
+    go func() {
+        status.Printf("Starting dest scp %s\n", destContext.AbsPath(destPath))
+        destSession.SetCmdArgs("scp", "-tr", destContext.AbsPath(destPath))
+        retCode, err := destContext.StartCmdAndWait(destSession)
+        status.Printf("Dest scp exited with %d and %#v\n", retCode, err)
+        done<-err
+    }()
+    err = <-done
+    if err != nil { return err }
+    err = <-done
+    if err != nil { return err }
+    return err
 }
 
 func (ctx *ExecContext) AbsPath(p string) string {
@@ -418,6 +571,10 @@ func (ctx *ExecContext) Uname() string {
         panic(err)
     }
     return ctx.uname
+}
+
+func (ctx *ExecContext) IsLocal() bool {
+    return ctx.Hostname() == ""
 }
 
 func (ctx *ExecContext) IsWindows() bool {
