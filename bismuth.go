@@ -363,23 +363,19 @@ func (ctx *ExecContext) AbsPath(p string) string {
 
 func (ctx *ExecContext) Stat(p string) (os.FileInfo, error) {
     flagStr := "-c"
-    formatStr := "%F,%f,%i,%d,%h,%u,%g,%s,%X,%Y,%Z"
+    formatStr := "%F,%f,%s,%Y"
     if ctx.IsDarwin() {
         flagStr = "-f"
-        formatStr = "%HT,%Xp,%i,%d,%l,%u,%g,%z,%a,%m,%c"
+        formatStr = "%HT,%Xp,%z,%m"
     }
     p = ctx.AbsPath(p)
     stdout, _, retcode, err := ctx.Run("stat", flagStr, formatStr, p)
-    log.Printf("stat %s %s\n", p, stdout)
+    // log.Printf("stat %s -- %s\n", p, strings.TrimSpace(string(stdout)))
     if err != nil { return nil, err }
     if retcode != 0 { return nil, nil }
-        // statres = out.strip().split(",")
-        // text_mode = statres.pop(0).lower()
-        // res = StatRes((int(statres[0], 16),) + tuple(int(sr) for sr in statres[1:]))
-        // res.text_mode = text_mode
-
-
-    return nil, nil
+    fileInfo, err := NewFileInfoIsh(p, string(stdout))
+    if err != nil { return nil, err }
+    return fileInfo, nil
 }
 
 func (ctx *ExecContext) PathExists(path string) (bool, error) {
