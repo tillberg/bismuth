@@ -315,7 +315,7 @@ func (ctx *ExecContext) QuoteShell(suffix string, s string) error {
     if err != nil { return err }
     stdout := ctx.newLogger(suffix)
     defer stdout.Close()
-    stderr := ctx.newLogger(fmt.Sprintf("%s/err", suffix))
+    stderr := ctx.newLogger(suffix)
     defer stderr.Close()
     session.SetStdout(stdout)
     session.SetStderr(stderr)
@@ -323,8 +323,20 @@ func (ctx *ExecContext) QuoteShell(suffix string, s string) error {
     return err
 }
 
+func (ctx ExecContext) getShellCommand(cwd string, args []string) string {
+    cmd := shellquote.Join(args...)
+    if cwd != "" {
+        cmd = fmt.Sprintf("%s && %s", shellquote.Join("cd", ctx.AbsPath(cwd)), cmd)
+    }
+    return cmd
+}
+
+func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) error {
+    return ctx.QuoteShell(suffix, ctx.getShellCommand(cwd, args))
+}
+
 func (ctx *ExecContext) Quote(suffix string, args ...string) error {
-    return ctx.QuoteShell(suffix, shellquote.Join(args...))
+    return ctx.QuoteShell(suffix, ctx.getShellCommand("", args))
 }
 
 func (ctx *ExecContext) RunShell(s string) (stdout []byte, stderr []byte, retCode int, err error) {
@@ -338,17 +350,25 @@ func (ctx *ExecContext) RunShell(s string) (stdout []byte, stderr []byte, retCod
     return bufOut.Bytes(), bufErr.Bytes(), retCode, nil
 }
 
+func (ctx *ExecContext) RunCwd(cwd string, args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
+    return ctx.RunShell(ctx.getShellCommand(cwd, args))
+}
+
 func (ctx *ExecContext) Run(args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
-    return ctx.RunShell(shellquote.Join(args...))
+    return ctx.RunShell(ctx.getShellCommand("", args))
 }
 
-func (ctx *ExecContext) OutputShell(s string) (stdout []byte, err error) {
-    stdout, _, _, err = ctx.RunShell(s)
-    return stdout, err
+func (ctx *ExecContext) OutputShell(s string) (stdout string, err error) {
+    _stdout, _, _, err := ctx.RunShell(s)
+    return strings.TrimSpace(string(_stdout)), err
 }
 
-func (ctx *ExecContext) Output(args ...string) (stdout []byte, err error) {
-    return ctx.OutputShell(shellquote.Join(args...))
+func (ctx *ExecContext) OutputCwd(cwd string, args ...string) (stdout string, err error) {
+    return ctx.OutputShell(ctx.getShellCommand(cwd, args))
+}
+
+func (ctx *ExecContext) Output(args ...string) (stdout string, err error) {
+    return ctx.OutputShell(ctx.getShellCommand("", args))
 }
 
 func (ctx *ExecContext) AbsPath(p string) string {
