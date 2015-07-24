@@ -334,60 +334,61 @@ func (ctx *ExecContext) StartCmdAndWait(session Session) (int, error) {
     return 0, nil
 }
 
-type SessionSetupFn func(session Session, ready chan bool, done chan bool)
+type SessionSetupFn func(session Session, ready chan error, done chan bool)
 
 func (ctx *ExecContext) ExecSession(setupFns ...SessionSetupFn) (int, error) {
     session, err := ctx.MakeSession()
     if err != nil { return -1, err }
-    ready := make(chan bool)
+    ready := make(chan error)
     done := make(chan bool)
+    defer func() { for _, _ = range setupFns { done<-true } }()
     for _, setupFn := range setupFns {
         go setupFn(session, ready, done)
-        <-ready
+        err = <-ready
+        if err != nil {
+            return -1, err
+        }
     }
     retCode, err := ctx.StartCmdAndWait(session)
-    for _, _ = range setupFns {
-        done<-true
-    }
     return retCode, err
 }
 
 func (ctx *ExecContext) SessionQuote(suffix string) SessionSetupFn {
-    fn := func(session Session, ready chan bool, done chan bool) {
+    fn := func(session Session, ready chan error, done chan bool) {
         stdout := ctx.newLogger(suffix)
         stderr := ctx.newLogger(suffix)
         defer stdout.Close()
         defer stderr.Close()
         session.SetStdout(stdout)
         session.SetStderr(stderr)
-        ready<-true
+        ready<-nil
         <-done
     }
     return fn
 }
 
 func SessionShell(cmd string) SessionSetupFn {
-    fn := func(session Session, ready chan bool, done chan bool) {
+    fn := func(session Session, ready chan error, done chan bool) {
         session.SetCmdShell(cmd)
-        ready<-true
+        ready<-nil
         <-done
     }
     return fn
 }
 
 func SessionArgs(args ...string) SessionSetupFn {
-    fn := func(session Session, ready chan bool, done chan bool) {
+    fn := func(session Session, ready chan error, done chan bool) {
         session.SetCmdArgs(args...)
-        ready<-true
+        ready<-nil
         <-done
     }
     return fn
 }
 
 func SessionCwd(cwd string) SessionSetupFn {
-    fn := func(session Session, ready chan bool, done chan bool) {
+    fn := func(session Session, ready chan error, done chan bool) {
         session.SetCwd(cwd)
-        ready<-true
+        ready<-nil
         <-done
     }
     return fn
@@ -395,17 +396,48 @@ func SessionCwd(cwd string) SessionSetupFn {
 
 func SessionBuffer() (SessionSetupFn, chan []byte) {
     bufChan := make(chan []byte)
-    fn := func(session Session, ready chan bool, done chan bool) {
+    fn := func(session Session, ready chan error, done chan bool) {
         var bufOut bytes.Buffer
         var bufErr bytes.Buffer
         session.SetStdout(&bufOut)
         session.SetStderr(&bufErr)
-        ready<-true
+        ready<-nil
         <-done
         bufChan<-bufOut.Bytes()
         bufChan<-bufErr.Bytes()
     }
     return fn, bufChan
+}
+
+func SessionPipeStdout(stdout io.Writer) SessionSetupFn {
+    return func(session Session, ready chan error, done chan bool) {
+        session.SetStdout(stdout)
+        ready<-nil
+        <-done
+    }
+}
+
+func SessionPipeStdin(chanStdin chan io.Writer) SessionSetupFn {
+    return func(session Session, ready chan error, done chan bool) {
+        stdin, err := session.StdinPipe()
+        if err != nil {
+            ready<-err
+            return
+        }
+        chanStdin<-stdin
+        ready<-nil
+        <-done
+    }
+}
+
+func (ctx *ExecContext) QuotePipeOut(suffix string, stdout io.Writer, cwd string, args ...string) (err error) {
+    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdout(stdout), SessionCwd(cwd), SessionArgs(args...))
+    return err
+}
+
+func (ctx *ExecContext) QuotePipeIn(suffix string, chanStdin chan io.Writer, cwd string, args ...string) (err error) {
+    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdin(chanStdin), SessionCwd(cwd), SessionArgs(args...))
+    return err
 }
 
 func (ctx *ExecContext) QuoteShell(suffix string, s string) (err error) {
