@@ -255,12 +255,17 @@ func (ctx *ExecContext) Logger() *log.Logger {
 
 func (ctx *ExecContext) StartCmdAndWait(session Session) (retCode int, err error) {
     cmdlog := ctx.newLogger("")
-    cmdlog.Printf("@(dim:$) %s\n", session.GetFullCmdShell())
-    cmdlog.Close()
-    _, err = session.Start()
+    defer cmdlog.Close()
+    cmdlog.Printf("@(dim:$) %s", session.GetFullCmdShell())
+    pid, err := session.Start()
+    cmdlog.Printf(" @(dim)(@(r)@(blue:%d)@(dim))@(r)", pid)
     if err != nil { return -1, err }
     defer ctx.closeSession(session)
-    return session.Wait()
+    retCode, err = session.Wait()
+    color := "green"
+    if retCode != 0 { color = "red" }
+    cmdlog.Printf(" @(dim:->) @(" + color + ":%d)\n", retCode)
+    return retCode, err
 }
 
 type SessionSetupFn func(session Session, ready chan error, done chan bool)
