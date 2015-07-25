@@ -18,8 +18,7 @@ type FileInfoIsh struct {
 }
 
 func NewFileInfoIsh(p string, stat string) (*FileInfoIsh, error) {
-    stat = strings.TrimSpace(stat)
-    parts := strings.Split(stat, ",")
+    parts := strings.Split(strings.TrimSpace(stat), ",")
     if len(parts) != 4 {
         return nil, errors.New(fmt.Sprintf("NewFileInfoIsh got bad stat result [%#v] for %s", stat, p))
     }

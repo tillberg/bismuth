@@ -10,8 +10,10 @@ import (
     "os"
     "os/exec"
     "path"
+    "strconv"
     "strings"
     "sync"
+    "time"
     "golang.org/x/crypto/ssh"
     "golang.org/x/crypto/ssh/agent"
     "github.com/kballard/go-shellquote"
@@ -21,28 +23,55 @@ import (
 type Session interface {
     Close() error
     SetCwd(cwd string)
+    GetFullCmdShell() string
     SetCmdShell(cmd string)
     SetCmdArgs(args ...string)
-    Start() error
-    Wait() error
+    Start() (pid int, err error)
+    Wait() (retCode int, err error)
     StdinPipe() (io.WriteCloser, error)
     StdoutPipe() (io.Reader, error)
     SetStdout(writer io.Writer)
     SetStderr(writer io.Writer)
 }
 
-func getShellCommand(cwd string, cmd string) string {
+var resultCodeEscapeBytes []byte = []byte{0x01, 0x7e, 0x12, 0x6b, 0x6a, 0x44, 0x7f, 0x21, 0x0b, 0x15, 0x1f, 0x4a, 0x0d, 0x67 }
+// var resultCodeEscapeBytes []byte = []byte("DSKJFHSDKJFH ")
+var resultCodeEscapeString string = fmt.Sprintf("%s", resultCodeEscapeBytes)
+func getWrappedShellCommand(cmd string) string {
+    return shellquote.Join("sh", "-c", "echo $$ >&2;" + cmd) + ";printf " + resultCodeEscapeString + "\"$?\\n\" >&2"
+    // To run this yourself: log.Printf("%s\n", shellquote.Join("sh", "-c", s))
+}
+
+func getShellCommand(cwd string, execCmd string, includeExec bool) string {
+    cmd := ""
     if cwd != "" {
-        cmd = fmt.Sprintf("%s && %s", shellquote.Join("cd", cwd), cmd)
+        cmd += shellquote.Join("cd", cwd) + " && "
     }
-    return cmd
+    if includeExec {
+        cmd += "exec "
+    }
+    return cmd + execCmd
+}
+
+const pidReceiveTimeout = 3 * time.Second
+var timeoutError error = errors.New("timed out")
+func receiveParseInt(strChan chan string) (int, error) {
+    select {
+    case str := <-strChan:
+        val, err := strconv.ParseInt(str, 10, 32)
+        if err != nil { return -1, err }
+        return int(val), nil
+    case <-time.After(pidReceiveTimeout):
+        return -1, timeoutError
+    }
 }
 
 // Extend ssh.Session so that it implements the Session interface
 type SshSession struct {
     *ssh.Session
-    cwd      string
-    shellCmd string
+    cwd         string
+    shellCmd    string
+    retCodeChan chan string
 }
 func NewSshSession(_session *ssh.Session) *SshSession {
     s := &SshSession{}
@@ -52,30 +81,65 @@ func NewSshSession(_session *ssh.Session) *SshSession {
 func (s *SshSession) SetStdout(writer io.Writer) { s.Stdout = writer }
 func (s *SshSession) SetStderr(writer io.Writer) { s.Stderr = writer }
 func (s *SshSession) SetCwd(cwd string) { s.cwd = cwd }
+func (s *SshSession) getFullCmdShell() string { return getShellCommand(s.cwd, s.shellCmd, true) }
+func (s *SshSession) GetFullCmdShell() string { return getShellCommand(s.cwd, s.shellCmd, false) }
 func (s *SshSession) SetCmdShell(cmd string) { s.shellCmd = cmd }
 func (s *SshSession) SetCmdArgs(args ...string) { s.SetCmdShell(shellquote.Join(args...)) }
-func (s *SshSession) Start() error { return s.Session.Start(getShellCommand(s.cwd, s.shellCmd)) }
+func (s *SshSession) Start() (pid int, err error) {
+    pidChan := make(chan string, 1)
+    s.retCodeChan = make(chan string, 1)
+    s.Stderr = NewFilteredWriter(s.Stderr, pidChan, s.retCodeChan)
+    err = s.Session.Start(getWrappedShellCommand(s.getFullCmdShell()))
+    if err != nil { return -1, err }
+    pid, err = receiveParseInt(pidChan)
+    if err == timeoutError { return -1, errors.New("Timed out waiting for PID") }
+    return pid, err
+}
+func (s *SshSession) Wait() (retCode int, err error) {
+    err = s.Session.Wait()
+    if err != nil { return -1, err }
+    retCode, err = receiveParseInt(s.retCodeChan)
+    if err == timeoutError { return -1, errors.New("Timed out waiting for retCode") }
+    return retCode, err
+}
 
 type LocalSession struct {
     *exec.Cmd
-    cwd      string
-    shellCmd string
+    cwd         string
+    shellCmd    string
+    retCodeChan chan string
 }
 func NewLocalSession() *LocalSession {
     s := &LocalSession{}
     s.Cmd = exec.Command("sh", "tbd")
     return s
 }
-func (s *LocalSession) SetCwd(cwd string) { s.cwd = cwd }
-func (s *LocalSession) SetCmdShell(cmd string) { s.shellCmd = cmd }
-func (s *LocalSession) SetCmdArgs(args ...string) { s.SetCmdShell(shellquote.Join(args...)) }
-func (s *LocalSession) Start() error {
-    s.Args = []string{"sh", "-c", getShellCommand(s.cwd, s.shellCmd)}
-    return s.Cmd.Start()
-}
-func (s *LocalSession) Close() error { return nil }
 func (s *LocalSession) SetStdout(writer io.Writer) { s.Stdout = writer }
 func (s *LocalSession) SetStderr(writer io.Writer) { s.Stderr = writer }
+func (s *LocalSession) SetCwd(cwd string) { s.cwd = cwd }
+func (s *LocalSession) getFullCmdShell() string { return getShellCommand(s.cwd, s.shellCmd, true) }
+func (s *LocalSession) GetFullCmdShell() string { return getShellCommand(s.cwd, s.shellCmd, false) }
+func (s *LocalSession) SetCmdShell(cmd string) { s.shellCmd = cmd }
+func (s *LocalSession) SetCmdArgs(args ...string) { s.SetCmdShell(shellquote.Join(args...)) }
+func (s *LocalSession) Start() (pid int, err error) {
+    pidChan := make(chan string, 1)
+    s.retCodeChan = make(chan string, 1)
+    s.Stderr = NewFilteredWriter(s.Stderr, pidChan, s.retCodeChan)
+    s.Args = []string{"sh", "-c", getWrappedShellCommand(s.getFullCmdShell())}
+    err = s.Cmd.Start()
+    if err != nil { return -1, err }
+    pid, err = receiveParseInt(pidChan)
+    if err == timeoutError { return -1, errors.New("Timed out waiting for PID") }
+    return pid, err
+}
+func (s *LocalSession) Wait() (retCode int, err error) {
+    err = s.Cmd.Wait()
+    if err != nil { return -1, err }
+    retCode, err = receiveParseInt(s.retCodeChan)
+    if err == timeoutError { return -1, errors.New("Timed out waiting for retCode") }
+    return retCode, err
+}
+func (s *LocalSession) Close() error { return nil }
 func (s *LocalSession) StdoutPipe() (io.Reader, error) {
     readCloser, err := s.Cmd.StdoutPipe()
     if err != nil { return nil, err }
@@ -287,6 +351,10 @@ func (ctx *ExecContext) updatedHostname() {
     ctx.logger.SetPrefix(fmt.Sprintf("@(dim)[%s] ", ctx.nameAnsi))
 }
 
+func (ctx *ExecContext) SshAddress() string {
+    return fmt.Sprintf("%s@%s", ctx.Username(), ctx.Hostname())
+}
+
 func (ctx *ExecContext) NameAnsi() string {
     ctx.lock()
     defer ctx.unlock()
@@ -316,22 +384,14 @@ func (ctx *ExecContext) Logger() *log.Logger {
     return ctx.logger
 }
 
-func (ctx *ExecContext) StartCmdAndWait(session Session) (int, error) {
-    err := session.Start()
+func (ctx *ExecContext) StartCmdAndWait(session Session) (retCode int, err error) {
+    cmdlog := ctx.newLogger("")
+    cmdlog.Printf("@(dim:$) %s\n", session.GetFullCmdShell())
+    cmdlog.Close()
+    _, err = session.Start()
     if err != nil { return -1, err }
     defer ctx.closeSession(session)
-    err = session.Wait()
-    if err != nil {
-        if exitError, ok := err.(*ssh.ExitError); ok {
-            retCode := exitError.ExitStatus()
-            if retCode > 0 {
-                return retCode, nil
-            }
-            return retCode, err
-        }
-        return -1, err
-    }
-    return 0, nil
+    return session.Wait()
 }
 
 type SessionSetupFn func(session Session, ready chan error, done chan bool)
@@ -431,27 +491,27 @@ func SessionPipeStdin(chanStdin chan io.Writer) SessionSetupFn {
 }
 
 func (ctx *ExecContext) QuotePipeOut(suffix string, stdout io.Writer, cwd string, args ...string) (err error) {
-    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdout(stdout), SessionCwd(cwd), SessionArgs(args...))
+    _, err = ctx.ExecSession(SessionPipeStdout(stdout), SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
     return err
 }
 
 func (ctx *ExecContext) QuotePipeIn(suffix string, chanStdin chan io.Writer, cwd string, args ...string) (err error) {
-    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdin(chanStdin), SessionCwd(cwd), SessionArgs(args...))
+    _, err = ctx.ExecSession(SessionPipeStdin(chanStdin), SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
     return err
 }
 
 func (ctx *ExecContext) QuoteShell(suffix string, s string) (err error) {
-    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionShell(s))
+    _, err = ctx.ExecSession(SessionShell(s), ctx.SessionQuote(suffix))
     return err
 }
 
 func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) (err error) {
-    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionCwd(cwd), SessionArgs(args...))
+    _, err = ctx.ExecSession(SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
     return err
 }
 
 func (ctx *ExecContext) Quote(suffix string, args ...string) (err error) {
-    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionArgs(args...))
+    _, err = ctx.ExecSession(SessionArgs(args...), ctx.SessionQuote(suffix))
     return err
 }
 
@@ -483,7 +543,7 @@ func (ctx *ExecContext) OutputShell(s string) (stdout string, err error) {
     bufSetup, bufChan := SessionBuffer()
     _, err = ctx.ExecSession(bufSetup, SessionShell(s))
     stdout = strings.TrimSpace(string(<-bufChan))
-    <-bufChan
+    <-bufChan // ignore stderr
     return stdout, err
 }
 
@@ -491,7 +551,7 @@ func (ctx *ExecContext) OutputCwd(cwd string, args ...string) (stdout string, er
     bufSetup, bufChan := SessionBuffer()
     _, err = ctx.ExecSession(bufSetup, SessionCwd(cwd), SessionArgs(args...))
     stdout = strings.TrimSpace(string(<-bufChan))
-    <-bufChan
+    <-bufChan // ignore stderr
     return stdout, err
 }
 
@@ -499,7 +559,7 @@ func (ctx *ExecContext) Output(args ...string) (stdout string, err error) {
     bufSetup, bufChan := SessionBuffer()
     _, err = ctx.ExecSession(bufSetup, SessionArgs(args...))
     stdout = strings.TrimSpace(string(<-bufChan))
-    <-bufChan
+    <-bufChan // ignore stderr
     return stdout, err
 }
 
@@ -557,8 +617,11 @@ func (ctx *ExecContext) UploadRecursive(srcPath string, destContext *ExecContext
 }
 
 func (ctx *ExecContext) AbsPath(p string) string {
-    if p[:2] == "~/" {
-        p = p[:2]
+    // Rewrite home-relative paths as simply relative paths, which
+    // we resolve in the next step relative to $HOME
+    if p == "~" { p = "" }
+    if len(p) >= 2 && p[:2] == "~/" {
+        p = p[2:]
     }
     if !path.IsAbs(p) {
         p = path.Join([]string{ctx.env["HOME"], p}...)
@@ -574,10 +637,11 @@ func (ctx *ExecContext) Stat(p string) (os.FileInfo, error) {
         formatStr = "%HT,%Xp,%z,%m"
     }
     p = ctx.AbsPath(p)
-    stdout, _, retcode, err := ctx.Run("stat", flagStr, formatStr, p)
+    stdout, _, retCode, err := ctx.Run("stat", flagStr, formatStr, p)
     // log.Printf("stat %s -- %s\n", p, strings.TrimSpace(string(stdout)))
     if err != nil { return nil, err }
-    if retcode != 0 { return nil, nil }
+    if retCode == 1 { return nil, nil }
+    if retCode != 0 { return nil, errors.New(fmt.Sprintf("stat returned unexpected code %d", retCode)) }
     fileInfo, err := NewFileInfoIsh(p, string(stdout))
     if err != nil { return nil, err }
     return fileInfo, nil
