@@ -253,37 +253,63 @@ func (ctx *ExecContext) Logger() *log.Logger {
     return ctx.logger
 }
 
-func (ctx *ExecContext) StartCmdAndWait(session Session) (retCode int, err error) {
-    cmdlog := ctx.newLogger("")
-    defer cmdlog.Close()
-    cmdlog.Printf("@(dim:$) %s", session.GetFullCmdShell())
-    pid, err := session.Start()
-    cmdlog.Printf(" @(dim)(@(r)@(blue:%d)@(dim))@(r)", pid)
-    if err != nil { return -1, err }
-    defer ctx.closeSession(session)
-    retCode, err = session.Wait()
-    color := "green"
-    if retCode != 0 { color = "red" }
-    cmdlog.Printf(" @(dim:->) @(" + color + ":%d)\n", retCode)
-    return retCode, err
+func (ctx *ExecContext) StartCmd(session Session) (pid int, retCodeChan chan int, err error) {
+    cmdLog := ctx.newLogger("")
+    cmdLog.Printf("@(dim:$) %s", session.GetFullCmdShell())
+    pid, err = session.Start()
+    cmdLog.Printf(" @(dim)(@(r)@(blue:%d)@(dim))@(r)", pid)
+    if err != nil { return -1, nil, err }
+    retCodeChan = make(chan int, 1)
+    go func() {
+        defer cmdLog.Close()
+        defer ctx.closeSession(session)
+        retCode, err := session.Wait()
+        cmdLog.Printf(" @dim:->) ")
+        if err != nil {
+            cmdLog.Printf("@(red:%v)", err)
+        } else {
+            color := "green"
+            if retCode != 0 { color = "red" }
+            cmdLog.Printf(" @(dim:->) @(" + color + ":%d)\n", retCode)
+        }
+        retCodeChan<-retCode
+    }()
+    return pid, retCodeChan, err
 }
 
 type SessionSetupFn func(session Session, ready chan error, done chan bool)
 
-func (ctx *ExecContext) ExecSession(setupFns ...SessionSetupFn) (int, error) {
+func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (pid int, retCodeChan chan int, err error) {
     session, err := ctx.MakeSession()
-    if err != nil { return -1, err }
+    if err != nil { return -1, nil, err }
     ready := make(chan error)
     done := make(chan bool)
-    defer func() { for _, _ = range setupFns { done<-true } }()
+    cleanup := func() {
+        for _, _ = range setupFns {
+            done<-true
+        }
+    }
     for _, setupFn := range setupFns {
         go setupFn(session, ready, done)
         err = <-ready
         if err != nil {
-            return -1, err
+            cleanup()
+            return -1, nil, err
         }
     }
-    retCode, err := ctx.StartCmdAndWait(session)
+    pid, retCodeChan2, err := ctx.StartCmd(session)
+    retCodeChan = make(chan int)
+    go func() {
+        retCodeChan <-<- retCodeChan2
+        cleanup()
+    }()
+    return pid, retCodeChan, err
+}
+
+func (ctx *ExecContext) ExecSession(setupFns ...SessionSetupFn) (retCode int, err error) {
+    _, retCodeChan, err := ctx.StartSession(setupFns...)
+    if err != nil { return -1, err }
+    retCode = <-retCodeChan
     return retCode, err
 }
 
@@ -384,6 +410,10 @@ func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) (err
     return err
 }
 
+func (ctx *ExecContext) QuoteDaemon(suffix string, args ...string) (pid int, retCodeChan chan int, err error) {
+    return ctx.StartSession(SessionArgs(args...), ctx.SessionQuote(suffix))
+}
+
 func (ctx *ExecContext) Quote(suffix string, args ...string) (err error) {
     _, err = ctx.ExecSession(SessionArgs(args...), ctx.SessionQuote(suffix))
     return err
@@ -472,14 +502,16 @@ func (ctx *ExecContext) UploadRecursive(srcPath string, destContext *ExecContext
     go func() {
         status.Printf("Starting source scp %s\n", ctx.AbsPath(srcPath))
         srcSession.SetCmdArgs("scp", "-rfp", ctx.AbsPath(srcPath))
-        retCode, err := ctx.StartCmdAndWait(srcSession)
+        _, retCodeChan, err := ctx.StartCmd(srcSession)
+        retCode := <-retCodeChan
         status.Printf("Src scp exited with %d and %#v\n", retCode, err)
         done<-err
     }()
     go func() {
         status.Printf("Starting dest scp %s\n", destContext.AbsPath(destPath))
         destSession.SetCmdArgs("scp", "-tr", destContext.AbsPath(destPath))
-        retCode, err := destContext.StartCmdAndWait(destSession)
+        _, retCodeChan, err := destContext.StartCmd(destSession)
+        retCode := <-retCodeChan
         status.Printf("Dest scp exited with %d and %#v\n", retCode, err)
         done<-err
     }()
