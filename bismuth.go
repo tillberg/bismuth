@@ -377,7 +377,7 @@ func SessionPipeStdout(stdout io.Writer) SessionSetupFn {
     }
 }
 
-func SessionPipeStdin(chanStdin chan io.Writer) SessionSetupFn {
+func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
     return func(session Session, ready chan error, done chan bool) {
         stdin, err := session.StdinPipe()
         if err != nil {
@@ -395,7 +395,7 @@ func (ctx *ExecContext) QuotePipeOut(suffix string, stdout io.Writer, cwd string
     return err
 }
 
-func (ctx *ExecContext) QuotePipeIn(suffix string, chanStdin chan io.Writer, cwd string, args ...string) (err error) {
+func (ctx *ExecContext) QuotePipeIn(suffix string, chanStdin chan io.WriteCloser, cwd string, args ...string) (err error) {
     _, err = ctx.ExecSession(SessionPipeStdin(chanStdin), SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
     return err
 }
@@ -557,6 +557,28 @@ func (ctx *ExecContext) PathExists(path string) (bool, error) {
     stat, err := ctx.Stat(path)
     if err != nil { return false, err }
     return stat != nil, nil
+}
+
+func (ctx *ExecContext) WriteFile(p string, b []byte) (err error) {
+    stdinChan := make(chan io.WriteCloser, 1)
+    errChan := make(chan error, 1)
+    go func() {
+        stdin := <-stdinChan
+        for len(b) > 0 {
+            nn, err := stdin.Write(b)
+            b = b[nn:]
+            if err != nil {
+                errChan<-err
+                return
+            }
+        }
+        stdin.Close()
+        errChan<-nil
+    }()
+    _, err = ctx.ExecSession(SessionPipeStdin(stdinChan), SessionArgs("dd", "of=" + p))
+    if err != nil { return err }
+    err = <-errChan
+    return err
 }
 
 func (ctx *ExecContext) Close() {
