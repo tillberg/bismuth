@@ -7,7 +7,7 @@ import (
 )
 
 type FilteredWriter struct {
-    nextWriter  io.Writer
+    nextWriter  io.WriteCloser
     readPrefix  bool
     buf         []byte
     msgBuf      []byte
@@ -15,12 +15,19 @@ type FilteredWriter struct {
     retCodeChan chan string
 }
 
-func NewFilteredWriter(nextWriter io.Writer, pidChan chan string, retCodeChan chan string) io.Writer {
+func NewFilteredWriter(nextWriter io.WriteCloser, pidChan chan string, retCodeChan chan string) io.Writer {
     w := &FilteredWriter{}
     w.nextWriter = nextWriter
     w.pidChan = pidChan
     w.retCodeChan = retCodeChan
     return w
+}
+
+func (w *FilteredWriter) Close() error {
+    if w.nextWriter != nil {
+        return w.nextWriter.Close()
+    }
+    return nil
 }
 
 var newlineByte byte = 0x0a

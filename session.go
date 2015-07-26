@@ -21,8 +21,9 @@ type Session interface {
     Wait() (retCode int, err error)
     StdinPipe() (io.WriteCloser, error)
     StdoutPipe() (io.Reader, error)
-    SetStdout(writer io.Writer)
-    SetStderr(writer io.Writer)
+    SetStdout(writer io.WriteCloser)
+    SetStderr(writer io.WriteCloser)
+    Pid() int
 }
 
 var resultCodeEscapeBytes []byte = []byte{0x01, 0x7e, 0x12, 0x6b, 0x6a, 0x44, 0x7f, 0x21, 0x0b, 0x15, 0x1f, 0x4a, 0x0d, 0x67 }
@@ -56,20 +57,26 @@ func receiveParseInt(strChan chan string) (int, error) {
     }
 }
 
+type PseudoCloser struct {
+    io.Writer
+}
+func (p PseudoCloser) Close() error { return nil }
+
 // Extend ssh.Session so that it implements the Session interface
 type SshSession struct {
     *ssh.Session
     cwd         string
     shellCmd    string
     retCodeChan chan string
+    pid         int
 }
 func NewSshSession(_session *ssh.Session) *SshSession {
     s := &SshSession{}
     s.Session = _session
     return s
 }
-func (s *SshSession) SetStdout(writer io.Writer) { s.Stdout = writer }
-func (s *SshSession) SetStderr(writer io.Writer) { s.Stderr = writer }
+func (s *SshSession) SetStdout(writer io.WriteCloser) { s.Stdout = writer }
+func (s *SshSession) SetStderr(writer io.WriteCloser) { s.Stderr = writer }
 func (s *SshSession) SetCwd(cwd string) { s.cwd = cwd }
 func (s *SshSession) getFullCmdShell() string { return getShellCommand(s.cwd, s.shellCmd, true) }
 func (s *SshSession) GetFullCmdShell() string { return getShellCommand(s.cwd, s.shellCmd, false) }
@@ -78,12 +85,16 @@ func (s *SshSession) SetCmdArgs(args ...string) { s.SetCmdShell(shellquote.Join(
 func (s *SshSession) Start() (pid int, err error) {
     pidChan := make(chan string, 1)
     s.retCodeChan = make(chan string, 1)
-    s.Stderr = NewFilteredWriter(s.Stderr, pidChan, s.retCodeChan)
+    var tmp io.WriteCloser
+    if s.Stderr != nil {
+        tmp = &PseudoCloser{s.Stderr}
+    }
+    s.Stderr = NewFilteredWriter(tmp, pidChan, s.retCodeChan)
     err = s.Session.Start(getWrappedShellCommand(s.getFullCmdShell()))
     if err != nil { return -1, err }
-    pid, err = receiveParseInt(pidChan)
+    s.pid, err = receiveParseInt(pidChan)
     if err == timeoutError { return -1, errors.New("Timed out waiting for PID") }
-    return pid, err
+    return s.pid, err
 }
 func (s *SshSession) Wait() (retCode int, err error) {
     err = s.Session.Wait()
@@ -92,20 +103,23 @@ func (s *SshSession) Wait() (retCode int, err error) {
     if err == timeoutError { return -1, errors.New("Timed out waiting for retCode") }
     return retCode, err
 }
+func (s *SshSession) Pid() (pid int) { return s.pid }
 
 type LocalSession struct {
     *exec.Cmd
     cwd         string
     shellCmd    string
     retCodeChan chan string
+    pid         int
 }
 func NewLocalSession() *LocalSession {
     s := &LocalSession{}
     s.Cmd = exec.Command("sh", "tbd")
+    s.Cmd.Stdin = nil
     return s
 }
-func (s *LocalSession) SetStdout(writer io.Writer) { s.Stdout = writer }
-func (s *LocalSession) SetStderr(writer io.Writer) { s.Stderr = writer }
+func (s *LocalSession) SetStdout(writer io.WriteCloser) { s.Stdout = writer }
+func (s *LocalSession) SetStderr(writer io.WriteCloser) { s.Stderr = writer }
 func (s *LocalSession) SetCwd(cwd string) { s.cwd = cwd }
 func (s *LocalSession) getFullCmdShell() string { return getShellCommand(s.cwd, s.shellCmd, true) }
 func (s *LocalSession) GetFullCmdShell() string { return getShellCommand(s.cwd, s.shellCmd, false) }
@@ -114,13 +128,17 @@ func (s *LocalSession) SetCmdArgs(args ...string) { s.SetCmdShell(shellquote.Joi
 func (s *LocalSession) Start() (pid int, err error) {
     pidChan := make(chan string, 1)
     s.retCodeChan = make(chan string, 1)
-    s.Stderr = NewFilteredWriter(s.Stderr, pidChan, s.retCodeChan)
+    var tmp io.WriteCloser
+    if s.Stderr != nil {
+        tmp = &PseudoCloser{s.Stderr}
+    }
+    s.Stderr = NewFilteredWriter(tmp, pidChan, s.retCodeChan)
     s.Args = []string{"sh", "-c", getWrappedShellCommand(s.getFullCmdShell())}
     err = s.Cmd.Start()
     if err != nil { return -1, err }
-    pid, err = receiveParseInt(pidChan)
+    s.pid, err = receiveParseInt(pidChan)
     if err == timeoutError { return -1, errors.New("Timed out waiting for PID") }
-    return pid, err
+    return s.pid, err
 }
 func (s *LocalSession) Wait() (retCode int, err error) {
     err = s.Cmd.Wait()
@@ -129,6 +147,7 @@ func (s *LocalSession) Wait() (retCode int, err error) {
     if err == timeoutError { return -1, errors.New("Timed out waiting for retCode") }
     return retCode, err
 }
+func (s *LocalSession) Pid() (pid int) { return s.pid }
 func (s *LocalSession) Close() error { return nil }
 func (s *LocalSession) StdoutPipe() (io.Reader, error) {
     readCloser, err := s.Cmd.StdoutPipe()

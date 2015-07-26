@@ -27,7 +27,7 @@ type ExecContext struct {
     sshClient  *ssh.Client
     connected  bool
 
-    numRunning int
+    sessions   []Session
     numWaiting int
     poolDone   chan bool
 
@@ -145,7 +145,7 @@ func (ctx *ExecContext) assertConnected() error {
     return nil
 }
 
-func (ctx *ExecContext) _makeSession() (Session, error) {
+func (ctx *ExecContext) makeSession() (Session, error) {
     var session Session
     if ctx.hostname != "" {
         sshSession, err := ctx.sshClient.NewSession()
@@ -164,26 +164,54 @@ func (ctx *ExecContext) MakeSession() (Session, error) {
     if err != nil {
         return nil, err
     }
-    if ctx.numRunning < maxSessions {
-        ctx.numRunning++
-    } else {
+    if len(ctx.sessions) >= maxSessions {
         ctx.numWaiting++
         ctx.unlock()
         <-ctx.poolDone
         ctx.lock()
     }
-    return ctx._makeSession()
+    session, err := ctx.makeSession()
+    ctx.sessions = append(ctx.sessions, session)
+    return session, err
 }
 
-func (ctx *ExecContext) closeSession(session Session) {
+func (ctx *ExecContext) CloseSession(session Session) {
     session.Close()
     ctx.lock()
-    ctx.numRunning--
+    removed := false
+    for i, otherSession := range ctx.sessions {
+        if otherSession == session {
+            if i == len(ctx.sessions) - 1 {
+                ctx.sessions = ctx.sessions[:i]
+            } else {
+                ctx.sessions = append(ctx.sessions[:i], ctx.sessions[i+1:]...)
+            }
+            removed = true
+            break
+        }
+    }
+    if !removed {
+        ctx.logger.Printf("@(error:Failed to remove my session)\n")
+    }
     if (ctx.numWaiting > 0) {
         ctx.poolDone<-true
         ctx.numWaiting--
     }
     ctx.unlock()
+}
+
+func (ctx *ExecContext) KillAllSessions() (err error) {
+    ctx.lock()
+    sessions := ctx.sessions
+    ctx.unlock()
+    for _, session := range sessions {
+        pid := session.Pid()
+        if pid > 0 {
+            err = ctx.Quote("kill", "kill", fmt.Sprintf("%d", pid))
+            if err != nil { return err }
+        }
+    }
+    return nil
 }
 
 func (ctx *ExecContext) Username() string {
@@ -262,11 +290,10 @@ func (ctx *ExecContext) StartCmd(session Session) (pid int, retCodeChan chan int
     retCodeChan = make(chan int, 1)
     go func() {
         defer cmdLog.Close()
-        defer ctx.closeSession(session)
+        defer ctx.CloseSession(session)
         retCode, err := session.Wait()
-        cmdLog.Printf(" @dim:->) ")
         if err != nil {
-            cmdLog.Printf("@(red:%v)", err)
+            cmdLog.Printf(" @(red:%v)", err)
         } else {
             color := "green"
             if retCode != 0 { color = "red" }
@@ -300,8 +327,9 @@ func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (pid int, retCo
     pid, retCodeChan2, err := ctx.StartCmd(session)
     retCodeChan = make(chan int)
     go func() {
-        retCodeChan <-<- retCodeChan2
+        retCode := <- retCodeChan2
         cleanup()
+        retCodeChan <- retCode
     }()
     return pid, retCodeChan, err
 }
@@ -354,11 +382,16 @@ func SessionCwd(cwd string) SessionSetupFn {
     return fn
 }
 
+type BufferCloser struct {
+    bytes.Buffer
+}
+func (b BufferCloser) Close() error { return nil }
+
 func SessionBuffer() (SessionSetupFn, chan []byte) {
     bufChan := make(chan []byte)
     fn := func(session Session, ready chan error, done chan bool) {
-        var bufOut bytes.Buffer
-        var bufErr bytes.Buffer
+        var bufOut BufferCloser
+        var bufErr BufferCloser
         session.SetStdout(&bufOut)
         session.SetStderr(&bufErr)
         ready<-nil
@@ -369,7 +402,7 @@ func SessionBuffer() (SessionSetupFn, chan []byte) {
     return fn, bufChan
 }
 
-func SessionPipeStdout(stdout io.Writer) SessionSetupFn {
+func SessionPipeStdout(stdout io.WriteCloser) SessionSetupFn {
     return func(session Session, ready chan error, done chan bool) {
         session.SetStdout(stdout)
         ready<-nil
@@ -390,7 +423,7 @@ func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
     }
 }
 
-func (ctx *ExecContext) QuotePipeOut(suffix string, stdout io.Writer, cwd string, args ...string) (err error) {
+func (ctx *ExecContext) QuotePipeOut(suffix string, stdout io.WriteCloser, cwd string, args ...string) (err error) {
     _, err = ctx.ExecSession(SessionPipeStdout(stdout), SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
     return err
 }
@@ -559,6 +592,14 @@ func (ctx *ExecContext) PathExists(path string) (bool, error) {
     return stat != nil, nil
 }
 
+func (ctx *ExecContext) ListDirectory(path string) (files []string, err error) {
+    out, err := ctx.OutputCwd(path, "ls", "-A")
+    if err != nil { return nil, err }
+    out = strings.TrimSpace(out)
+    if out == "" { return []string{}, nil }
+    return strings.Split(out, "\n"), nil
+}
+
 func (ctx *ExecContext) WriteFile(p string, b []byte) (err error) {
     stdinChan := make(chan io.WriteCloser, 1)
     errChan := make(chan error, 1)
@@ -581,15 +622,27 @@ func (ctx *ExecContext) WriteFile(p string, b []byte) (err error) {
     return err
 }
 
+func (ctx *ExecContext) ReadFile(p string) (b []byte, err error) {
+    b, _, _, err = ctx.Run("cat", ctx.AbsPath(p))
+    return b, err
+}
+
+func (ctx *ExecContext) DeleteFile(p string) (err error) {
+    _, _, retCode, err := ctx.Run("rm", ctx.AbsPath(p))
+    if err != nil { return err }
+    if retCode != 0 { return errors.New("Error deleting file") }
+    return nil
+}
+
 func (ctx *ExecContext) Close() {
-    ctx.mutex.Lock()
-    defer ctx.mutex.Unlock()
+    ctx.lock()
+    defer ctx.unlock()
     ctx.close()
 }
 
 func (ctx *ExecContext) Uname() string {
-    ctx.mutex.Lock()
-    defer ctx.mutex.Unlock()
+    ctx.lock()
+    defer ctx.unlock()
     err := ctx.assertConnected()
     if err != nil {
         panic(err)
