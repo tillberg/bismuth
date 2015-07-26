@@ -593,7 +593,7 @@ func (ctx *ExecContext) PathExists(path string) (bool, error) {
 }
 
 func (ctx *ExecContext) ListDirectory(path string) (files []string, err error) {
-    out, err := ctx.OutputCwd(path, "ls", "-A")
+    out, err := ctx.Output("ls", "-A", ctx.AbsPath(path))
     if err != nil { return nil, err }
     out = strings.TrimSpace(out)
     if out == "" { return []string{}, nil }
@@ -627,11 +627,22 @@ func (ctx *ExecContext) ReadFile(p string) (b []byte, err error) {
     return b, err
 }
 
+func (ctx *ExecContext) Symlink(dest string, src string) (err error) {
+    _, _, retCode, err := ctx.Run("ln", "-s", ctx.AbsPath(dest), ctx.AbsPath(src))
+    if err != nil { return err }
+    if retCode != 0 { return errors.New("Error creating symlink") }
+    return nil
+}
+
 func (ctx *ExecContext) DeleteFile(p string) (err error) {
     _, _, retCode, err := ctx.Run("rm", ctx.AbsPath(p))
     if err != nil { return err }
     if retCode != 0 { return errors.New("Error deleting file") }
     return nil
+}
+
+func (ctx *ExecContext) DeleteLink(p string) (err error) {
+    return ctx.DeleteFile(p)
 }
 
 func (ctx *ExecContext) Close() {
