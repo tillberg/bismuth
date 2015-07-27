@@ -204,12 +204,17 @@ func (ctx *ExecContext) KillAllSessions() (err error) {
     ctx.lock()
     sessions := ctx.sessions
     ctx.unlock()
+    done := make(chan bool, len(sessions))
     for _, session := range sessions {
+        session.OnClose(done)
         pid := session.Pid()
         if pid > 0 {
             err = ctx.Quote("kill", "kill", fmt.Sprintf("%d", pid))
             if err != nil { return err }
         }
+    }
+    for _, _ = range sessions {
+        <-done
     }
     return nil
 }

@@ -13,6 +13,7 @@ import (
 
 type Session interface {
     Close() error
+    OnClose(onClose chan bool)
     SetCwd(cwd string)
     GetFullCmdShell() string
     SetCmdShell(cmd string)
@@ -59,18 +60,31 @@ func receiveParseInt(strChan chan string) (int, error) {
 
 type PseudoCloser struct {
     io.Writer
-    onClose func()
+    onCloses []func()
 }
 func (p *PseudoCloser) Close() error {
-    if p.onClose != nil { p.onClose() }
+    for _, onClose := range p.onCloses { onClose() }
     return nil
 }
 func (p *PseudoCloser) OnClose(cb func()) {
-    p.onClose = cb
+    p.onCloses = append(p.onCloses, cb)
 }
 
 func NewPseudoCloser(writer io.Writer) *PseudoCloser {
     return &PseudoCloser{writer, nil}
+}
+
+func callClosers(onCloses chan chan bool) {
+    for {
+        select {
+        case onCloseChan := <-onCloses:
+            onCloseChan<-true
+        // OnClose and Close could be called concurrently; this is
+        // an ugly hack to close that gap:
+        case <-time.After(10 * time.Second):
+            return
+        }
+    }
 }
 
 // Extend ssh.Session so that it implements the Session interface
@@ -80,10 +94,12 @@ type SshSession struct {
     shellCmd    string
     retCodeChan chan string
     pid         int
+    onCloses    chan chan bool
 }
 func NewSshSession(_session *ssh.Session) *SshSession {
     s := &SshSession{}
     s.Session = _session
+    s.onCloses = make(chan chan bool, 5)
     return s
 }
 func (s *SshSession) SetStdout(writer io.WriteCloser) { s.Stdout = writer }
@@ -115,6 +131,13 @@ func (s *SshSession) Wait() (retCode int, err error) {
     return retCode, err
 }
 func (s *SshSession) Pid() (pid int) { return s.pid }
+func (s *SshSession) Close() error {
+    go callClosers(s.onCloses)
+    return s.Session.Close()
+}
+func (s *SshSession) OnClose(onClose chan bool) {
+    s.onCloses<-onClose
+}
 
 type LocalSession struct {
     *exec.Cmd
@@ -122,11 +145,13 @@ type LocalSession struct {
     shellCmd    string
     retCodeChan chan string
     pid         int
+    onCloses    chan chan bool
 }
 func NewLocalSession() *LocalSession {
     s := &LocalSession{}
     s.Cmd = exec.Command("sh", "tbd")
     s.Cmd.Stdin = nil
+    s.onCloses = make(chan chan bool, 5)
     return s
 }
 func (s *LocalSession) SetStdout(writer io.WriteCloser) { s.Stdout = writer }
@@ -159,7 +184,13 @@ func (s *LocalSession) Wait() (retCode int, err error) {
     return retCode, err
 }
 func (s *LocalSession) Pid() (pid int) { return s.pid }
-func (s *LocalSession) Close() error { return nil }
+func (s *LocalSession) Close() error {
+    go callClosers(s.onCloses)
+    return nil
+}
+func (s *LocalSession) OnClose(onClose chan bool) {
+    s.onCloses<-onClose
+}
 func (s *LocalSession) StdoutPipe() (io.Reader, error) {
     readCloser, err := s.Cmd.StdoutPipe()
     if err != nil { return nil, err }
