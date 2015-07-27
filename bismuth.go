@@ -281,23 +281,26 @@ func (ctx *ExecContext) Logger() *log.Logger {
     return ctx.logger
 }
 
+var verbose = false
 func (ctx *ExecContext) StartCmd(session Session) (pid int, retCodeChan chan int, err error) {
     cmdLog := ctx.newLogger("")
-    cmdLog.Printf("@(dim:$) %s", session.GetFullCmdShell())
+    if verbose { cmdLog.Printf("@(dim:$) %s", session.GetFullCmdShell()) }
     pid, err = session.Start()
-    cmdLog.Printf(" @(dim)(@(r)@(blue:%d)@(dim))@(r)", pid)
+    if verbose { cmdLog.Printf(" @(dim)(@(r)@(blue:%d)@(dim))@(r)", pid) }
     if err != nil { return -1, nil, err }
     retCodeChan = make(chan int, 1)
     go func() {
         defer cmdLog.Close()
         defer ctx.CloseSession(session)
         retCode, err := session.Wait()
-        if err != nil {
-            cmdLog.Printf(" @(red:%v)", err)
-        } else {
-            color := "green"
-            if retCode != 0 { color = "red" }
-            cmdLog.Printf(" @(dim:->) @(" + color + ":%d)\n", retCode)
+        if verbose {
+            if err != nil {
+                cmdLog.Printf(" @(red:%v)", err)
+            } else {
+                color := "green"
+                if retCode != 0 { color = "red" }
+                cmdLog.Printf(" @(dim:->) @(" + color + ":%d)\n", retCode)
+            }
         }
         retCodeChan<-retCode
     }()
@@ -438,13 +441,25 @@ func (ctx *ExecContext) QuoteShell(suffix string, s string) (err error) {
     return err
 }
 
+func (ctx *ExecContext) QuoteCwdBuf(suffix string, cwd string, args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
+    bufSetup, bufChan := SessionBuffer()
+    retCode, err = ctx.ExecSession(SessionCwd(cwd), SessionArgs(args...), bufSetup, ctx.SessionQuote(suffix))
+    stdout = <-bufChan
+    stderr = <-bufChan
+    return stdout, stderr, retCode, nil
+}
+
 func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) (err error) {
     _, err = ctx.ExecSession(SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
     return err
 }
 
-func (ctx *ExecContext) QuoteDaemon(suffix string, args ...string) (pid int, retCodeChan chan int, err error) {
-    return ctx.StartSession(SessionArgs(args...), ctx.SessionQuote(suffix))
+func (ctx *ExecContext) QuoteDaemonCwdPipeOut(suffix string, cwd string, stdout io.WriteCloser, args ...string) (pid int, retCodeChan chan int, err error) {
+    return ctx.StartSession(SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix), SessionPipeStdout(stdout))
+}
+
+func (ctx *ExecContext) QuoteDaemonCwd(suffix string, cwd string, args ...string) (pid int, retCodeChan chan int, err error) {
+    return ctx.StartSession(SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
 }
 
 func (ctx *ExecContext) Quote(suffix string, args ...string) (err error) {

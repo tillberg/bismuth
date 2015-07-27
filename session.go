@@ -59,8 +59,19 @@ func receiveParseInt(strChan chan string) (int, error) {
 
 type PseudoCloser struct {
     io.Writer
+    onClose func()
 }
-func (p PseudoCloser) Close() error { return nil }
+func (p *PseudoCloser) Close() error {
+    if p.onClose != nil { p.onClose() }
+    return nil
+}
+func (p *PseudoCloser) OnClose(cb func()) {
+    p.onClose = cb
+}
+
+func NewPseudoCloser(writer io.Writer) *PseudoCloser {
+    return &PseudoCloser{writer, nil}
+}
 
 // Extend ssh.Session so that it implements the Session interface
 type SshSession struct {
@@ -87,7 +98,7 @@ func (s *SshSession) Start() (pid int, err error) {
     s.retCodeChan = make(chan string, 1)
     var tmp io.WriteCloser
     if s.Stderr != nil {
-        tmp = &PseudoCloser{s.Stderr}
+        tmp = NewPseudoCloser(s.Stderr)
     }
     s.Stderr = NewFilteredWriter(tmp, pidChan, s.retCodeChan)
     err = s.Session.Start(getWrappedShellCommand(s.getFullCmdShell()))
@@ -130,7 +141,7 @@ func (s *LocalSession) Start() (pid int, err error) {
     s.retCodeChan = make(chan string, 1)
     var tmp io.WriteCloser
     if s.Stderr != nil {
-        tmp = &PseudoCloser{s.Stderr}
+        tmp = NewPseudoCloser(s.Stderr)
     }
     s.Stderr = NewFilteredWriter(tmp, pidChan, s.retCodeChan)
     s.Args = []string{"sh", "-c", getWrappedShellCommand(s.getFullCmdShell())}

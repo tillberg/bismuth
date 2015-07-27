@@ -3,7 +3,7 @@ package bismuth
 import (
     "errors"
     "io"
-    "github.com/tillberg/ansi-log"
+    // "github.com/tillberg/ansi-log"
 )
 
 type FilteredWriter struct {
@@ -64,7 +64,7 @@ func (w *FilteredWriter) Write(p []byte) (nn int, err error) {
     }
     for w.nextWriter != nil && len(w.buf) > 0 {
         numBytesWritten, err := w.nextWriter.Write(w.buf)
-        log.Printf("Wrote %d bytes to the underlying stream (out of %d in buf or %d received): %q\n", numBytesWritten, len(w.buf), len(p), string(w.buf))
+        // log.Printf("Wrote %d bytes to the underlying stream (out of %d in buf or %d received): %q\n", numBytesWritten, len(w.buf), len(p), string(w.buf))
         if numBytesWritten == 0 { return len(p), errors.New("nextWriter wrote only zero bytes") }
         w.buf = w.buf[numBytesWritten:]
         if err != nil { return len(p), err }
