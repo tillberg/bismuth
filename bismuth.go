@@ -40,6 +40,11 @@ type ExecContext struct {
 
 var onceInit sync.Once
 
+var verbose = false
+func SetVerbose(_verbose bool) {
+    verbose = _verbose
+}
+
 func (ctx *ExecContext) Init() {
     ctx.poolDone = make(chan bool)
     ctx.port = 22
@@ -286,7 +291,6 @@ func (ctx *ExecContext) Logger() *log.Logger {
     return ctx.logger
 }
 
-var verbose = false
 func (ctx *ExecContext) StartCmd(session Session) (pid int, retCodeChan chan int, err error) {
     cmdLog := ctx.newLogger("")
     if verbose { cmdLog.Printf("@(dim:$) %s", session.GetFullCmdShell()) }
