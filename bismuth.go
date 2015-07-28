@@ -339,23 +339,27 @@ func (ctx ExecContext) ReverseTunnel(srcAddr string, destAddr string) (err error
     go func() {
         for {
             client, err := listener.Accept()
-            if err != nil { log.Bail(err) }
+            if err == io.EOF {
+                ctx.logger.Printf("@(dim:Encountered EOF on reverse tunnel from) %s @(dim:to) %s\n", srcAddr, destAddr)
+                return
+            }
+            if err != nil { ctx.logger.Bail(err) }
             go func() {
                 defer client.Close()
                 // Establish connection with remote server
                 remote, err := net.Dial("tcp", destAddr)
-                if err != nil { log.Bail(err) }
+                if err != nil { ctx.logger.Bail(err) }
                 chDone := make(chan bool)
                 // Start remote -> local data transfer
                 go func() {
                     _, err := io.Copy(client, remote)
-                    if err != nil { log.Println("error while copy remote->local:", err) }
+                    if err != nil { ctx.logger.Println("error while copy remote->local:", err) }
                     chDone <- true
                 }()
                 // Start local -> remote data transfer
                 go func() {
                     _, err := io.Copy(remote, client)
-                    if err != nil { log.Println(err) }
+                    if err != nil { ctx.logger.Println(err) }
                     chDone <- true
                 }()
                 <-chDone
