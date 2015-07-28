@@ -572,21 +572,51 @@ type uploadTask struct {
 }
 
 func (ctx *ExecContext) UploadRecursiveExcludes(srcRootPath string, destContext *ExecContext, destRootPath string, excludes []string) error {
-    status := ctx.NewLogger("")
-    status.Printf("@(dim:Uploading) @(path:%s) @(dim:to) %s:@(path:%s)@(dim:...)\n", srcRootPath, destContext.NameAnsi(), destRootPath)
-
     srcRootPath = ctx.AbsPath(srcRootPath)
-    destRootPath = ctx.AbsPath(destRootPath)
+    destRootPath = destContext.AbsPath(destRootPath)
+    return ctx.uploadRecursiveTar(srcRootPath, destContext, destRootPath, excludes)
+}
 
+func (ctx *ExecContext) uploadRecursiveTar(srcRootPath string, destContext *ExecContext, destRootPath string, excludes []string) (err error) {
+    chanErr := make(chan error)
+    stdinChan := make(chan io.WriteCloser)
+    go func() {
+        err = destContext.Mkdirp(destRootPath)
+        if err != nil {
+            chanErr<-err
+            return
+        }
+        untarArgs := []string{"tar", "xzf", "-", "-m"}
+        err := destContext.QuotePipeIn("untar", stdinChan, destRootPath, untarArgs...)
+        chanErr<-err
+    }()
+    ctxStdin := <-stdinChan
+    tarArgs := []string{"tar", "czf", "-"}
+    for _, exclude := range excludes {
+        tarArgs = append(tarArgs, "--exclude=" + exclude)
+    }
+    tarArgs = append(tarArgs, "./")
+    err = ctx.QuotePipeOut("tar", ctxStdin, srcRootPath, tarArgs...)
+    if err != nil {
+        return err
+    }
+    ctxStdin.Close()
+    err = <-chanErr
+    if err != nil {
+        return err
+    }
+    return nil
+}
+
+func (ctx *ExecContext) uploadRecursiveFallback(srcRootPath string, destContext *ExecContext, destRootPath string, excludes []string) error {
+    status := ctx.NewLogger("")
     excludeMap := make(map[string]bool)
     for _, exclude := range excludes {
         excludeMap[exclude] = true
     }
-
     numUploaders := maxSessions
     tasks := make(chan *uploadTask, 10)
     errors := make(chan error)
-
     for i := 0; i < numUploaders; i++ {
         go func() {
             for {
@@ -620,7 +650,6 @@ func (ctx *ExecContext) UploadRecursiveExcludes(srcRootPath string, destContext 
             errors<-nil
         }()
     }
-
     var uploadDir func(string) error
     uploadDir = func(p string) (err error) {
         tasks<-&uploadTask{true, p}
