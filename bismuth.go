@@ -54,7 +54,6 @@ func (ctx *ExecContext) Init() {
 
     onceInit.Do(func () {
         log.AddAnsiColorCode("host", 33)
-        log.AddAnsiColorCode("path", 36)
     })
     ctx.logger = ctx.newLogger("")
     ctx.updatedHostname()
@@ -502,12 +501,12 @@ func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
 }
 
 func (ctx *ExecContext) QuotePipeOut(suffix string, stdout io.WriteCloser, cwd string, args ...string) (err error) {
-    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdout(stdout), SessionCwd(cwd), SessionArgs(args...))
+    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdout(stdout), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
     return err
 }
 
 func (ctx *ExecContext) QuotePipeIn(suffix string, chanStdin chan io.WriteCloser, cwd string, args ...string) (err error) {
-    _, err = ctx.ExecSession(SessionPipeStdin(chanStdin), SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
+    _, err = ctx.ExecSession(SessionPipeStdin(chanStdin), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix))
     return err
 }
 
@@ -518,23 +517,23 @@ func (ctx *ExecContext) QuoteShell(suffix string, s string) (err error) {
 
 func (ctx *ExecContext) QuoteCwdBuf(suffix string, cwd string, args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
     bufSetup, bufChan := SessionBuffer()
-    retCode, err = ctx.ExecSession(SessionCwd(cwd), SessionArgs(args...), bufSetup, ctx.SessionQuote(suffix))
+    retCode, err = ctx.ExecSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), bufSetup, ctx.SessionQuote(suffix))
     stdout = <-bufChan
     stderr = <-bufChan
     return stdout, stderr, retCode, nil
 }
 
 func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) (err error) {
-    _, err = ctx.ExecSession(SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
+    _, err = ctx.ExecSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix))
     return err
 }
 
 func (ctx *ExecContext) QuoteDaemonCwdPipeOut(suffix string, cwd string, stdout io.WriteCloser, args ...string) (pid int, retCodeChan chan int, err error) {
-    return ctx.StartSession(SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix), SessionPipeStdout(stdout))
+    return ctx.StartSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix), SessionPipeStdout(stdout))
 }
 
 func (ctx *ExecContext) QuoteDaemonCwd(suffix string, cwd string, args ...string) (pid int, retCodeChan chan int, err error) {
-    return ctx.StartSession(SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
+    return ctx.StartSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix))
 }
 
 func (ctx *ExecContext) Quote(suffix string, args ...string) (err error) {
@@ -552,7 +551,7 @@ func (ctx *ExecContext) RunShell(s string) (stdout []byte, stderr []byte, retCod
 
 func (ctx *ExecContext) RunCwd(cwd string, args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
     bufSetup, bufChan := SessionBuffer()
-    retCode, err = ctx.ExecSession(bufSetup, SessionCwd(cwd), SessionArgs(args...))
+    retCode, err = ctx.ExecSession(bufSetup, SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
     stdout = <-bufChan
     stderr = <-bufChan
     return stdout, stderr, retCode, nil
@@ -576,7 +575,7 @@ func (ctx *ExecContext) OutputShell(s string) (stdout string, err error) {
 
 func (ctx *ExecContext) OutputCwd(cwd string, args ...string) (stdout string, err error) {
     bufSetup, bufChan := SessionBuffer()
-    _, err = ctx.ExecSession(bufSetup, SessionCwd(cwd), SessionArgs(args...))
+    _, err = ctx.ExecSession(bufSetup, SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
     stdout = strings.TrimSpace(string(<-bufChan))
     <-bufChan // ignore stderr
     return stdout, err
