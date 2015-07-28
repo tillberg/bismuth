@@ -99,6 +99,29 @@ func (ctx *ExecContext) connect() error {
     return nil
 }
 
+// Adapted from bufio.ScanLines, replacing \n with \000
+func dropCR(data []byte) []byte {
+    if len(data) > 0 && data[len(data)-1] == '\r' {
+        return data[0 : len(data)-1]
+    }
+    return data
+}
+func scanNullLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+    if atEOF && len(data) == 0 {
+        return 0, nil, nil
+    }
+    if i := bytes.IndexByte(data, '\000'); i >= 0 {
+        // We have a full newline-terminated line.
+        return i + 1, dropCR(data[0:i]), nil
+    }
+    // If we're at EOF, we have a final, non-terminated line. Return it.
+    if atEOF {
+        return len(data), dropCR(data), nil
+    }
+    // Request more data.
+    return 0, nil, nil
+}
+
 func (ctx *ExecContext) Connect() error {
     err := ctx.connect()
     if err != nil { return err }
@@ -119,11 +142,12 @@ func (ctx *ExecContext) Connect() error {
         }
     })
     doTask(func() {
-        stdout, err := ctx.Output("env")
+        stdout, err := ctx.Output("env", "-0")
         if err != nil {
             done<-err
         } else {
             scanner := bufio.NewScanner(strings.NewReader(string(stdout)))
+            scanner.Split(scanNullLines)
             for scanner.Scan() {
                 line := scanner.Text()
                 parts := strings.SplitN(line, "=", 2)
