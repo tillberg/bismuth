@@ -45,6 +45,8 @@ func SetVerbose(_verbose bool) {
     verbose = _verbose
 }
 
+var NotFoundError = errors.New("not found")
+
 func (ctx *ExecContext) Init() {
     ctx.poolDone = make(chan bool)
     ctx.port = 22
@@ -436,7 +438,7 @@ func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
 }
 
 func (ctx *ExecContext) QuotePipeOut(suffix string, stdout io.WriteCloser, cwd string, args ...string) (err error) {
-    _, err = ctx.ExecSession(SessionPipeStdout(stdout), SessionCwd(cwd), SessionArgs(args...), ctx.SessionQuote(suffix))
+    _, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdout(stdout), SessionCwd(cwd), SessionArgs(args...))
     return err
 }
 
@@ -524,59 +526,119 @@ func (ctx *ExecContext) Output(args ...string) (stdout string, err error) {
     return stdout, err
 }
 
-// This is super-duper slow because SCP is super-duper slow. But it works, at least some of the time.
-func (ctx *ExecContext) UploadRecursive(srcPath string, destContext *ExecContext, destPath string) error {
+type uploadTask struct {
+    isDir bool
+    p     string
+}
+
+func (ctx *ExecContext) UploadRecursiveExcludes(srcRootPath string, destContext *ExecContext, destRootPath string, excludes []string) error {
     status := ctx.NewLogger("")
-    status.Printf("Uploading %s to dest %s\n", srcPath, destPath)
-    srcSession, err := ctx.MakeSession()
-    if err != nil { return err }
-    destSession, err := destContext.MakeSession()
-    if err != nil { return err }
+    status.Printf("@(dim:Uploading) @(path:%s) @(dim:to) %s:@(path:%s)@(dim:...)\n", srcRootPath, destContext.NameAnsi(), destRootPath)
 
-    srcStderr := ctx.NewLogger("scp-src")
-    defer srcStderr.Close()
-    srcSession.SetStderr(srcStderr)
+    srcRootPath = ctx.AbsPath(srcRootPath)
+    destRootPath = ctx.AbsPath(destRootPath)
 
-    destStderr := destContext.NewLogger("scp-dest")
-    defer destStderr.Close()
-    destSession.SetStderr(destStderr)
+    excludeMap := make(map[string]bool)
+    for _, exclude := range excludes {
+        excludeMap[exclude] = true
+    }
 
-    srcStdin, err := srcSession.StdinPipe()
-    destStdin, err := destSession.StdinPipe()
+    numUploaders := maxSessions
+    tasks := make(chan *uploadTask, 10)
+    errors := make(chan error)
 
-    // Uncomment to watch:
-    // srcStdoutLog := ctx.NewLogger("scp-src/out")
-    // defer srcStdoutLog.Close()
-    // destStdoutLog := ctx.NewLogger("scp-dest/out")
-    // defer destStdoutLog.Close()
-    // srcSession.SetStdout(io.MultiWriter(destStdin, srcStdoutLog))
-    // destSession.SetStdout(io.MultiWriter(srcStdin, destStdoutLog))
+    for i := 0; i < numUploaders; i++ {
+        go func() {
+            for {
+                task := <-tasks
+                if task == nil {
+                    break
+                }
+                destPath := path.Join(destRootPath, task.p)
+                if task.isDir {
+                    status.Printf("@(error:mkdir -p) %s\n", destPath)
+                    err := destContext.Mkdirp(destPath)
+                    if err != nil {
+                        errors<-err
+                        return
+                    }
+                } else {
+                    srcPath := path.Join(srcRootPath, task.p)
+                    status.Printf("@(error:upload) %s -> %s\n", srcPath, destPath)
+                    contents, err := ctx.ReadFile(srcPath)
+                    if err != nil {
+                        errors<-err
+                        return
+                    }
+                    err = destContext.WriteFile(destPath, contents)
+                    if err != nil {
+                        errors<-err
+                        return
+                    }
+                }
+            }
+            errors<-nil
+        }()
+    }
 
-    srcSession.SetStdout(destStdin)
-    destSession.SetStdout(srcStdin)
-
-    done := make(chan error)
+    var uploadDir func(string) error
+    uploadDir = func(p string) (err error) {
+        tasks<-&uploadTask{true, p}
+        srcPath := path.Join(srcRootPath, p)
+        filenames, err := ctx.ListDirectory(srcPath)
+        if err != nil {
+            return err
+        }
+        for _, filename := range filenames {
+            _, excluded := excludeMap[filename]
+            if excluded {
+                continue
+            }
+            subPath := path.Join(p, filename)
+            stat, err := ctx.Stat(path.Join(srcRootPath, subPath))
+            if err == NotFoundError {
+                status.Printf("@(error:Failed to stat) %s\n", subPath)
+                continue
+            }
+            if err != nil {
+                return err
+            }
+            if stat.IsDir() {
+                err = uploadDir(subPath)
+                if err != nil {
+                    return err
+                }
+            } else {
+                tasks<-&uploadTask{false, subPath}
+            }
+        }
+        return nil
+    }
     go func() {
-        status.Printf("Starting source scp %s\n", ctx.AbsPath(srcPath))
-        srcSession.SetCmdArgs("scp", "-rfp", ctx.AbsPath(srcPath))
-        _, retCodeChan, err := ctx.StartCmd(srcSession)
-        retCode := <-retCodeChan
-        status.Printf("Src scp exited with %d and %#v\n", retCode, err)
-        done<-err
+        rootStat, err := ctx.Stat(srcRootPath)
+        if err != nil {
+            errors<-err
+            return
+        }
+        if rootStat.IsDir() {
+            err = uploadDir(".")
+            if err != nil {
+                errors<-err
+                return
+            }
+        } else {
+            tasks<-&uploadTask{false, "."}
+        }
+        for i := 0; i < numUploaders; i++ {
+            tasks<-nil
+        }
+        errors<-nil
     }()
-    go func() {
-        status.Printf("Starting dest scp %s\n", destContext.AbsPath(destPath))
-        destSession.SetCmdArgs("scp", "-tr", destContext.AbsPath(destPath))
-        _, retCodeChan, err := destContext.StartCmd(destSession)
-        retCode := <-retCodeChan
-        status.Printf("Dest scp exited with %d and %#v\n", retCode, err)
-        done<-err
-    }()
-    err = <-done
-    if err != nil { return err }
-    err = <-done
-    if err != nil { return err }
-    return err
+    for i := 0; i < numUploaders + 1; i++ {
+        err := <-errors
+        if err != nil { return err }
+    }
+    return nil
 }
 
 func (ctx *ExecContext) AbsPath(p string) string {
@@ -592,6 +654,15 @@ func (ctx *ExecContext) AbsPath(p string) string {
     return path.Clean(p)
 }
 
+
+func (ctx *ExecContext) Mkdirp(p string) (err error) {
+    if ctx.IsWindows() {
+        return errors.New("Not implemented")
+    }
+    _, err = ctx.Output("mkdir", "-p", ctx.AbsPath(p))
+    return err
+}
+
 func (ctx *ExecContext) Stat(p string) (os.FileInfo, error) {
     flagStr := "-c"
     formatStr := "%F,%f,%s,%Y"
@@ -603,7 +674,7 @@ func (ctx *ExecContext) Stat(p string) (os.FileInfo, error) {
     stdout, _, retCode, err := ctx.Run("stat", flagStr, formatStr, p)
     // log.Printf("stat %s -- %s\n", p, strings.TrimSpace(string(stdout)))
     if err != nil { return nil, err }
-    if retCode == 1 { return nil, nil }
+    if retCode == 1 { return nil, NotFoundError }
     if retCode != 0 { return nil, errors.New(fmt.Sprintf("stat returned unexpected code %d", retCode)) }
     fileInfo, err := NewFileInfoIsh(p, string(stdout))
     if err != nil { return nil, err }
@@ -612,6 +683,7 @@ func (ctx *ExecContext) Stat(p string) (os.FileInfo, error) {
 
 func (ctx *ExecContext) PathExists(path string) (bool, error) {
     stat, err := ctx.Stat(path)
+    if err == NotFoundError { return false, nil }
     if err != nil { return false, err }
     return stat != nil, nil
 }
