@@ -293,6 +293,46 @@ func (ctx *ExecContext) Logger() *log.Logger {
     return ctx.logger
 }
 
+func (ctx ExecContext) ReverseTunnel(srcAddr string, destAddr string) (err error) {
+    // TODO:
+    // - Return something to the caller that can be used to terminate listening.
+    ctx.lock()
+    defer ctx.unlock()
+    if ctx.hostname == "" {
+        return errors.New("ReverseTunnel not supported for local ExecContext")
+    }
+    listener, err := ctx.sshClient.Listen("tcp", srcAddr)
+    if err != nil { return err }
+    go func() {
+        for {
+            client, err := listener.Accept()
+            if err != nil { log.Bail(err) }
+            go func() {
+                defer client.Close()
+                // Establish connection with remote server
+                remote, err := net.Dial("tcp", destAddr)
+                if err != nil { log.Bail(err) }
+                chDone := make(chan bool)
+                // Start remote -> local data transfer
+                go func() {
+                    _, err := io.Copy(client, remote)
+                    if err != nil { log.Println("error while copy remote->local:", err) }
+                    chDone <- true
+                }()
+                // Start local -> remote data transfer
+                go func() {
+                    _, err := io.Copy(remote, client)
+                    if err != nil { log.Println(err) }
+                    chDone <- true
+                }()
+                <-chDone
+                <-chDone
+            }()
+        }
+    }()
+    return nil
+}
+
 func (ctx *ExecContext) StartCmd(session Session) (pid int, retCodeChan chan int, err error) {
     cmdLog := ctx.newLogger("")
     if verbose { cmdLog.Printf("@(dim:$) %s", session.GetFullCmdShell()) }
