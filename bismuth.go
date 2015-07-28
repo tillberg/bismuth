@@ -131,6 +131,7 @@ func (ctx *ExecContext) Connect() error {
         numTasks++
         go fn()
     }
+    unameDone := make(chan bool)
     doTask(func() {
         stdout, err := ctx.Output("uname")
         if err != nil {
@@ -139,14 +140,23 @@ func (ctx *ExecContext) Connect() error {
             ctx.uname = strings.TrimSpace(string(stdout))
             done<-nil
         }
+        unameDone<-true
     })
     doTask(func() {
-        stdout, err := ctx.Output("env", "-0")
+        <-unameDone
+        useNullTerminator := !ctx.IsDarwin()
+        envArgs := []string{"env"}
+        if !ctx.IsDarwin() {
+            envArgs = append(envArgs, "-0")
+        }
+        stdout, err := ctx.Output(envArgs...)
         if err != nil {
             done<-err
         } else {
             scanner := bufio.NewScanner(strings.NewReader(string(stdout)))
-            scanner.Split(scanNullLines)
+            if useNullTerminator {
+                scanner.Split(scanNullLines)
+            }
             for scanner.Scan() {
                 line := scanner.Text()
                 parts := strings.SplitN(line, "=", 2)
