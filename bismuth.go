@@ -550,6 +550,24 @@ func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
 	}
 }
 
+func SessionSetStdin(reader io.Reader) SessionSetupFn {
+	return func(session Session, ready chan error, done chan bool) {
+		session.SetStdin(reader)
+		ready <- nil
+		<-done
+	}
+}
+
+func SessionInteractive() SessionSetupFn {
+	return func(session Session, ready chan error, done chan bool) {
+		session.SetStdin(os.Stdin)
+		session.SetStdout(os.Stdout)
+		session.SetStderr(os.Stderr)
+		ready <- nil
+		<-done
+	}
+}
+
 func (ctx *ExecContext) QuotePipeOut(suffix string, stdout io.WriteCloser, cwd string, args ...string) (err error) {
 	_, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdout(stdout), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
 	return err
@@ -558,6 +576,10 @@ func (ctx *ExecContext) QuotePipeOut(suffix string, stdout io.WriteCloser, cwd s
 func (ctx *ExecContext) QuotePipeIn(suffix string, chanStdin chan io.WriteCloser, cwd string, args ...string) (err error) {
 	_, err = ctx.ExecSession(SessionPipeStdin(chanStdin), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix))
 	return err
+}
+
+func (ctx *ExecContext) ShellInteractive(s string) (retCode int, err error) {
+	return ctx.ExecSession(SessionShell(s), SessionInteractive())
 }
 
 func (ctx *ExecContext) QuoteShell(suffix string, s string) (err error) {

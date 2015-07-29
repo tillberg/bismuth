@@ -22,6 +22,7 @@ type Session interface {
 	Wait() (retCode int, err error)
 	StdinPipe() (io.WriteCloser, error)
 	StdoutPipe() (io.Reader, error)
+	SetStdin(reader io.Reader)
 	SetStdout(writer io.WriteCloser)
 	SetStderr(writer io.WriteCloser)
 	Pid() int
@@ -111,6 +112,7 @@ func NewSshSession(_session *ssh.Session) *SshSession {
 	s.onCloses = make(chan chan bool, 5)
 	return s
 }
+func (s *SshSession) SetStdin(reader io.Reader)       { s.Stdin = reader }
 func (s *SshSession) SetStdout(writer io.WriteCloser) { s.Stdout = writer }
 func (s *SshSession) SetStderr(writer io.WriteCloser) { s.Stderr = writer }
 func (s *SshSession) SetCwd(cwd string)               { s.cwd = cwd }
@@ -172,6 +174,7 @@ func NewLocalSession() *LocalSession {
 	s.onCloses = make(chan chan bool, 5)
 	return s
 }
+func (s *LocalSession) SetStdin(reader io.Reader)       { s.Stdin = reader }
 func (s *LocalSession) SetStdout(writer io.WriteCloser) { s.Stdout = writer }
 func (s *LocalSession) SetStderr(writer io.WriteCloser) { s.Stderr = writer }
 func (s *LocalSession) SetCwd(cwd string)               { s.cwd = cwd }
