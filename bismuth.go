@@ -582,9 +582,8 @@ func (ctx *ExecContext) ShellInteractive(s string) (retCode int, err error) {
 	return ctx.ExecSession(SessionShell(s), SessionInteractive())
 }
 
-func (ctx *ExecContext) QuoteShell(suffix string, s string) (err error) {
-	_, err = ctx.ExecSession(SessionShell(s), ctx.SessionQuote(suffix))
-	return err
+func (ctx *ExecContext) QuoteShell(suffix string, s string) (retCode int, err error) {
+	return ctx.ExecSession(SessionShell(s), ctx.SessionQuote(suffix))
 }
 
 func (ctx *ExecContext) QuoteCwdBuf(suffix string, cwd string, args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
@@ -595,9 +594,8 @@ func (ctx *ExecContext) QuoteCwdBuf(suffix string, cwd string, args ...string) (
 	return stdout, stderr, retCode, nil
 }
 
-func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) (err error) {
-	_, err = ctx.ExecSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix))
-	return err
+func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) (retCode int, err error) {
+	return ctx.ExecSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix))
 }
 
 func (ctx *ExecContext) QuoteDaemonCwdPipeOut(suffix string, cwd string, stdout io.WriteCloser, args ...string) (pid int, retCodeChan chan int, err error) {
