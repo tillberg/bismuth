@@ -18,7 +18,7 @@ import (
 )
 
 const maxSessionsPerContext = 5
-const networkTimeout = 4 * time.Second
+const networkTimeout = 10 * time.Second
 
 type ExecContext struct {
 	mutex    sync.Mutex
