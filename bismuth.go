@@ -25,9 +25,10 @@ type ExecContext struct {
 	hostname string
 	port     int
 
-	sshClient    *ssh.Client
-	hasConnected bool
-	isConnected  bool
+	sshClient      *ssh.Client
+	hasConnected   bool
+	isConnected    bool
+	disconnectCond *sync.Cond
 
 	sessions   []Session
 	numWaiting int
@@ -60,6 +61,7 @@ func (ctx *ExecContext) Init() {
 	})
 	ctx.logger = ctx.newLogger("")
 	ctx.updatedHostname()
+	ctx.disconnectCond = sync.NewCond(&ctx.mutex)
 
 }
 func NewExecContext() *ExecContext {
@@ -97,35 +99,6 @@ func (c *Conn) Write(b []byte) (int, error) {
 	return c.Conn.Write(b)
 }
 
-func SshDialTimeout(network, addr string, config *ssh.ClientConfig, timeout time.Duration) (*ssh.Client, error) {
-	conn, err := net.DialTimeout(network, addr, timeout)
-	if err != nil {
-		return nil, err
-	}
-
-	timeoutConn := &Conn{conn, timeout, timeout}
-	c, chans, reqs, err := ssh.NewClientConn(timeoutConn, addr, config)
-	if err != nil {
-		return nil, err
-	}
-	client := ssh.NewClient(c, chans, reqs)
-
-	// this sends keepalive packets every 2 seconds
-	// there's no useful response from these, so we can just abort if there's an error
-	go func() {
-		t := time.NewTicker(2 * time.Second)
-		defer t.Stop()
-		for {
-			<-t.C
-			_, _, err := client.Conn.SendRequest("keepalive@golang.org", true, nil)
-			if err != nil {
-				return
-			}
-		}
-	}()
-	return client, nil
-}
-
 func (ctx *ExecContext) close() {
 	if ctx.sshClient != nil {
 		ctx.logger.Printf("Closing previous connection...\n")
@@ -134,6 +107,15 @@ func (ctx *ExecContext) close() {
 		ctx.sshClient = nil
 	}
 	ctx.isConnected = false
+}
+
+func (ctx *ExecContext) disconnected() {
+	ctx.Logger().Println("DISCONNECTED 1")
+	ctx.lock()
+	ctx.isConnected = false
+	ctx.disconnectCond.Broadcast()
+	ctx.unlock()
+	ctx.Logger().Println("DISCONNECTED 2")
 }
 
 const sshTimeout = 4 * time.Second
@@ -152,12 +134,38 @@ func (ctx *ExecContext) reconnect() (err error) {
 			User: ctx.username,
 			Auth: auths,
 		}
+		addr := fmt.Sprintf("%s:%d", ctx.hostname, ctx.port)
 		ctx.logger.Printf("Dialing...\n")
-		ctx.sshClient, err = SshDialTimeout("tcp", fmt.Sprintf("%s:%d", ctx.hostname, ctx.port), config, sshTimeout)
+		conn, err := net.DialTimeout("tcp", addr, sshTimeout)
 		if err != nil {
-			ctx.logger.Printf("Got weird dial tone.\n")
+			ctx.logger.Printf("Failed on DialTimeout.\n")
 			return err
 		}
+
+		timeoutConn := &Conn{conn, sshTimeout, sshTimeout}
+		c, chans, reqs, err := ssh.NewClientConn(timeoutConn, addr, config)
+		if err != nil {
+			ctx.logger.Printf("Failed on ssh.NewClientConn.\n")
+			return err
+		}
+		client := ssh.NewClient(c, chans, reqs)
+
+		// this sends keepalive packets every 2 seconds
+		// there's no useful response from these, so we can just abort if there's an error
+		go func() {
+			t := time.NewTicker(2 * time.Second)
+			defer t.Stop()
+			for {
+				<-t.C
+				log.Println("PING")
+				_, _, err := client.Conn.SendRequest("keepalive@golang.org", true, nil)
+				if err != nil {
+					ctx.disconnected()
+					return
+				}
+			}
+		}()
+		ctx.sshClient = client
 		ctx.logger.Printf("Connected.\n")
 	}
 	ctx.isConnected = true
@@ -257,20 +265,40 @@ func (ctx *ExecContext) Connect() (err error) {
 }
 
 func (ctx *ExecContext) assertConnected() error {
-	if !ctx.hasConnected {
+	if !ctx.isConnected {
 		return errors.New("Not connected. Call Connect first.")
 	}
 	return nil
 }
 
-func (ctx *ExecContext) makeSession() (Session, error) {
-	var session Session
+func (ctx *ExecContext) makeSession() (session Session, err error) {
 	if ctx.hostname != "" {
-		sshSession, err := ctx.sshClient.NewSession()
+		errChan := make(chan error, 1)
+		go func() {
+			ctx.lock()
+			defer ctx.unlock()
+			sshSession, err := ctx.sshClient.NewSession()
+			if err != nil {
+				errChan <- err
+			} else {
+				session = NewSshSession(sshSession)
+				errChan <- nil
+			}
+		}()
+		go func() {
+			ctx.disconnectCond.Wait()
+			ctx.unlock()
+			ctx.Logger().Println("DISC 2")
+			errChan <- errors.New("Connection disconnected while creating new session.")
+			ctx.Logger().Println("DISC 3")
+		}()
+		// ctx is unlocked by the Wait call above
+		err = <-errChan
+		ctx.Logger().Printf("GOT ERR %#v\n", err)
+		ctx.lock()
 		if err != nil {
 			return nil, err
 		}
-		session = NewSshSession(sshSession)
 	} else {
 		session = NewLocalSession()
 	}
@@ -510,6 +538,7 @@ type SessionSetupFn func(session Session, ready chan error, done chan bool)
 func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (pid int, retCodeChan chan int, err error) {
 	session, err := ctx.MakeSession()
 	if err != nil {
+		ctx.logger.Printf("MakeSession returned %s\n", err)
 		return -1, nil, err
 	}
 	ready := make(chan error)
@@ -540,6 +569,7 @@ func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (pid int, retCo
 func (ctx *ExecContext) ExecSession(setupFns ...SessionSetupFn) (retCode int, err error) {
 	_, retCodeChan, err := ctx.StartSession(setupFns...)
 	if err != nil {
+		ctx.logger.Printf("StartSession returned %s\n", err)
 		return -1, err
 	}
 	retCode = <-retCodeChan
@@ -670,7 +700,7 @@ func (ctx *ExecContext) QuoteCwdBuf(suffix string, cwd string, args ...string) (
 	retCode, err = ctx.ExecSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), bufSetup, ctx.SessionQuote(suffix))
 	stdout = <-bufChan
 	stderr = <-bufChan
-	return stdout, stderr, retCode, nil
+	return stdout, stderr, retCode, err
 }
 
 func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) (retCode int, err error) {
@@ -693,30 +723,42 @@ func (ctx *ExecContext) Quote(suffix string, args ...string) (err error) {
 func (ctx *ExecContext) RunShell(s string) (stdout []byte, stderr []byte, retCode int, err error) {
 	bufSetup, bufChan := SessionBuffer()
 	retCode, err = ctx.ExecSession(bufSetup, SessionShell(s))
+	if err != nil {
+		return nil, nil, -1, err
+	}
 	stdout = <-bufChan
 	stderr = <-bufChan
-	return stdout, stderr, retCode, nil
+	return stdout, stderr, retCode, err
 }
 
 func (ctx *ExecContext) RunCwd(cwd string, args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
 	bufSetup, bufChan := SessionBuffer()
 	retCode, err = ctx.ExecSession(bufSetup, SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
+	if err != nil {
+		return nil, nil, -1, err
+	}
 	stdout = <-bufChan
 	stderr = <-bufChan
-	return stdout, stderr, retCode, nil
+	return stdout, stderr, retCode, err
 }
 
 func (ctx *ExecContext) Run(args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
 	bufSetup, bufChan := SessionBuffer()
 	retCode, err = ctx.ExecSession(bufSetup, SessionArgs(args...))
+	if err != nil {
+		return nil, nil, -1, err
+	}
 	stdout = <-bufChan
 	stderr = <-bufChan
-	return stdout, stderr, retCode, nil
+	return stdout, stderr, retCode, err
 }
 
 func (ctx *ExecContext) OutputShell(s string) (stdout string, err error) {
 	bufSetup, bufChan := SessionBuffer()
 	_, err = ctx.ExecSession(bufSetup, SessionShell(s))
+	if err != nil {
+		return "", err
+	}
 	stdout = strings.TrimSpace(string(<-bufChan))
 	<-bufChan // ignore stderr
 	return stdout, err
@@ -725,6 +767,9 @@ func (ctx *ExecContext) OutputShell(s string) (stdout string, err error) {
 func (ctx *ExecContext) OutputCwd(cwd string, args ...string) (stdout string, err error) {
 	bufSetup, bufChan := SessionBuffer()
 	_, err = ctx.ExecSession(bufSetup, SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
+	if err != nil {
+		return "", err
+	}
 	stdout = strings.TrimSpace(string(<-bufChan))
 	<-bufChan // ignore stderr
 	return stdout, err
@@ -733,6 +778,9 @@ func (ctx *ExecContext) OutputCwd(cwd string, args ...string) (stdout string, er
 func (ctx *ExecContext) Output(args ...string) (stdout string, err error) {
 	bufSetup, bufChan := SessionBuffer()
 	_, err = ctx.ExecSession(bufSetup, SessionArgs(args...))
+	if err != nil {
+		return "", err
+	}
 	stdout = strings.TrimSpace(string(<-bufChan))
 	<-bufChan // ignore stderr
 	return stdout, err
