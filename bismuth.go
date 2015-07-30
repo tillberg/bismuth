@@ -25,10 +25,9 @@ type ExecContext struct {
 	hostname string
 	port     int
 
-	sshClient      *ssh.Client
-	hasConnected   bool
-	isConnected    bool
-	disconnectCond *sync.Cond
+	sshClient    *ssh.Client
+	hasConnected bool
+	isConnected  bool
 
 	sessions   []Session
 	numWaiting int
@@ -50,6 +49,7 @@ func SetVerbose(_verbose bool) {
 }
 
 var NotFoundError = errors.New("not found")
+var NotConnectedError = errors.New("not connected")
 
 func (ctx *ExecContext) Init() {
 	ctx.poolDone = make(chan bool)
@@ -61,7 +61,6 @@ func (ctx *ExecContext) Init() {
 	})
 	ctx.logger = ctx.newLogger("")
 	ctx.updatedHostname()
-	ctx.disconnectCond = sync.NewCond(&ctx.mutex)
 
 }
 func NewExecContext() *ExecContext {
@@ -110,19 +109,15 @@ func (ctx *ExecContext) close() {
 }
 
 func (ctx *ExecContext) disconnected() {
-	ctx.Logger().Println("DISCONNECTED 1")
 	ctx.lock()
 	ctx.isConnected = false
-	ctx.disconnectCond.Broadcast()
 	ctx.unlock()
-	ctx.Logger().Println("DISCONNECTED 2")
 }
 
 const sshTimeout = 4 * time.Second
 
 func (ctx *ExecContext) reconnect() (err error) {
 	if ctx.hostname != "" {
-		ctx.logger.Printf("Connecting to SSH_AUTH_SOCK...\n")
 		agentConn, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
 		if err != nil {
 			return err
@@ -135,17 +130,14 @@ func (ctx *ExecContext) reconnect() (err error) {
 			Auth: auths,
 		}
 		addr := fmt.Sprintf("%s:%d", ctx.hostname, ctx.port)
-		ctx.logger.Printf("Dialing...\n")
 		conn, err := net.DialTimeout("tcp", addr, sshTimeout)
 		if err != nil {
-			ctx.logger.Printf("Failed on DialTimeout.\n")
 			return err
 		}
 
 		timeoutConn := &Conn{conn, sshTimeout, sshTimeout}
 		c, chans, reqs, err := ssh.NewClientConn(timeoutConn, addr, config)
 		if err != nil {
-			ctx.logger.Printf("Failed on ssh.NewClientConn.\n")
 			return err
 		}
 		client := ssh.NewClient(c, chans, reqs)
@@ -157,7 +149,6 @@ func (ctx *ExecContext) reconnect() (err error) {
 			defer t.Stop()
 			for {
 				<-t.C
-				log.Println("PING")
 				_, _, err := client.Conn.SendRequest("keepalive@golang.org", true, nil)
 				if err != nil {
 					ctx.disconnected()
@@ -166,7 +157,9 @@ func (ctx *ExecContext) reconnect() (err error) {
 			}
 		}()
 		ctx.sshClient = client
-		ctx.logger.Printf("Connected.\n")
+		if ctx.hasConnected {
+			ctx.logger.Printf("Reconnected.\n")
+		}
 	}
 	ctx.isConnected = true
 	return nil
@@ -266,39 +259,18 @@ func (ctx *ExecContext) Connect() (err error) {
 
 func (ctx *ExecContext) assertConnected() error {
 	if !ctx.isConnected {
-		return errors.New("Not connected. Call Connect first.")
+		return NotConnectedError
 	}
 	return nil
 }
 
 func (ctx *ExecContext) makeSession() (session Session, err error) {
 	if ctx.hostname != "" {
-		errChan := make(chan error, 1)
-		go func() {
-			ctx.lock()
-			defer ctx.unlock()
-			sshSession, err := ctx.sshClient.NewSession()
-			if err != nil {
-				errChan <- err
-			} else {
-				session = NewSshSession(sshSession)
-				errChan <- nil
-			}
-		}()
-		go func() {
-			ctx.disconnectCond.Wait()
-			ctx.unlock()
-			ctx.Logger().Println("DISC 2")
-			errChan <- errors.New("Connection disconnected while creating new session.")
-			ctx.Logger().Println("DISC 3")
-		}()
-		// ctx is unlocked by the Wait call above
-		err = <-errChan
-		ctx.Logger().Printf("GOT ERR %#v\n", err)
-		ctx.lock()
+		sshSession, err := ctx.sshClient.NewSession()
 		if err != nil {
 			return nil, err
 		}
+		session = NewSshSession(sshSession)
 	} else {
 		session = NewLocalSession()
 	}
@@ -538,7 +510,6 @@ type SessionSetupFn func(session Session, ready chan error, done chan bool)
 func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (pid int, retCodeChan chan int, err error) {
 	session, err := ctx.MakeSession()
 	if err != nil {
-		ctx.logger.Printf("MakeSession returned %s\n", err)
 		return -1, nil, err
 	}
 	ready := make(chan error)
@@ -569,7 +540,6 @@ func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (pid int, retCo
 func (ctx *ExecContext) ExecSession(setupFns ...SessionSetupFn) (retCode int, err error) {
 	_, retCodeChan, err := ctx.StartSession(setupFns...)
 	if err != nil {
-		ctx.logger.Printf("StartSession returned %s\n", err)
 		return -1, err
 	}
 	retCode = <-retCodeChan
