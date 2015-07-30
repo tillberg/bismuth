@@ -17,7 +17,8 @@ import (
 	"time"
 )
 
-const maxSessions = 5
+const maxSessionsPerContext = 5
+const networkTimeout = 4 * time.Second
 
 type ExecContext struct {
 	mutex    sync.Mutex
@@ -50,6 +51,7 @@ func SetVerbose(_verbose bool) {
 
 var NotFoundError = errors.New("not found")
 var NotConnectedError = errors.New("not connected")
+var NotHasConnectedError = errors.New("never connected")
 
 func (ctx *ExecContext) Init() {
 	ctx.poolDone = make(chan bool)
@@ -100,21 +102,11 @@ func (c *Conn) Write(b []byte) (int, error) {
 
 func (ctx *ExecContext) close() {
 	if ctx.sshClient != nil {
-		ctx.logger.Printf("Closing previous connection...\n")
 		ctx.sshClient.Close()
-		ctx.logger.Printf("Previous connection closed.\n")
 		ctx.sshClient = nil
 	}
 	ctx.isConnected = false
 }
-
-func (ctx *ExecContext) disconnected() {
-	ctx.lock()
-	ctx.isConnected = false
-	ctx.unlock()
-}
-
-const sshTimeout = 4 * time.Second
 
 func (ctx *ExecContext) reconnect() (err error) {
 	if ctx.hostname != "" {
@@ -130,36 +122,36 @@ func (ctx *ExecContext) reconnect() (err error) {
 			Auth: auths,
 		}
 		addr := fmt.Sprintf("%s:%d", ctx.hostname, ctx.port)
-		conn, err := net.DialTimeout("tcp", addr, sshTimeout)
+		conn, err := net.DialTimeout("tcp", addr, networkTimeout)
 		if err != nil {
 			return err
 		}
 
-		timeoutConn := &Conn{conn, sshTimeout, sshTimeout}
+		timeoutConn := &Conn{conn, networkTimeout, networkTimeout}
 		c, chans, reqs, err := ssh.NewClientConn(timeoutConn, addr, config)
 		if err != nil {
 			return err
 		}
 		client := ssh.NewClient(c, chans, reqs)
 
-		// this sends keepalive packets every 2 seconds
-		// there's no useful response from these, so we can just abort if there's an error
+		// Send periodic keepalive messages
 		go func() {
-			t := time.NewTicker(2 * time.Second)
+			t := time.NewTicker(networkTimeout / 2)
 			defer t.Stop()
 			for {
 				<-t.C
 				_, _, err := client.Conn.SendRequest("keepalive@golang.org", true, nil)
 				if err != nil {
-					ctx.disconnected()
+					ctx.lock()
+					if ctx.sshClient == client {
+						ctx.isConnected = false
+					}
+					ctx.unlock()
 					return
 				}
 			}
 		}()
 		ctx.sshClient = client
-		if ctx.hasConnected {
-			ctx.logger.Printf("Reconnected.\n")
-		}
 	}
 	ctx.isConnected = true
 	return nil
@@ -257,9 +249,22 @@ func (ctx *ExecContext) Connect() (err error) {
 	return nil
 }
 
+func (ctx *ExecContext) IsConnected() bool {
+	ctx.lock()
+	defer ctx.unlock()
+	return ctx.isConnected
+}
+
 func (ctx *ExecContext) assertConnected() error {
 	if !ctx.isConnected {
 		return NotConnectedError
+	}
+	return nil
+}
+
+func (ctx *ExecContext) assertHasConnected() error {
+	if !ctx.hasConnected {
+		return NotHasConnectedError
 	}
 	return nil
 }
@@ -284,7 +289,7 @@ func (ctx *ExecContext) MakeSession() (Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(ctx.sessions) >= maxSessions {
+	if len(ctx.sessions) >= maxSessionsPerContext {
 		ctx.numWaiting++
 		ctx.unlock()
 		<-ctx.poolDone
@@ -320,33 +325,38 @@ func (ctx *ExecContext) CloseSession(session Session) {
 	ctx.unlock()
 }
 
-const killTimeout = 3 * time.Second
+const killTimeout = 1 * time.Second
 
-func (ctx *ExecContext) KillAllSessions() (err error) {
+func (ctx *ExecContext) KillAllSessions() {
+	status := ctx.Logger()
 	ctx.lock()
+	if !ctx.isConnected {
+		// There's no sense in trying to kill sessions from a dead connection
+		ctx.unlock()
+		return
+	}
 	sessions := ctx.sessions
 	ctx.unlock()
-	done := make(chan bool, len(sessions))
+	sessionClosedChan := make(chan bool, len(sessions))
 	for _, session := range sessions {
-		session.OnClose(done)
+		session.OnClose(sessionClosedChan)
 		pid := session.Pid()
 		if pid > 0 {
-			err = ctx.Quote("kill", "kill", fmt.Sprintf("%d", pid))
+			err := ctx.Quote("kill", "kill", fmt.Sprintf("%d", pid))
 			if err != nil {
-				return err
+				status.Printf("Failed to kill process %d: %v\n", pid, err)
 			}
 		}
 	}
+	timeoutChan := time.After(killTimeout)
 	for _, _ = range sessions {
 		select {
-		case <-done:
+		case <-sessionClosedChan:
 			break
-		case <-time.After(killTimeout):
-			ctx.Logger().Printf("@(error:Timed out waiting for a process to close.)\n")
-			break
+		case <-timeoutChan:
+			return
 		}
 	}
-	return nil
 }
 
 func (ctx *ExecContext) Username() string {
@@ -433,10 +443,6 @@ func (ctx ExecContext) ReverseTunnel(srcAddr string, destAddr string) (listener 
 		for {
 			client, err := listener.Accept()
 			if err != nil {
-				closeErr := listener.Close()
-				if closeErr != nil {
-					ctx.Logger().Printf("@(error:Error closing reverse tunnel listener: %v)\n", closeErr)
-				}
 				errChan <- err
 				return
 			}
@@ -804,8 +810,8 @@ func (ctx *ExecContext) uploadRecursiveFallback(srcRootPath string, destContext 
 	for _, exclude := range excludes {
 		excludeMap[exclude] = true
 	}
-	numUploaders := maxSessions
-	tasks := make(chan *uploadTask, 10)
+	numUploaders := maxSessionsPerContext
+	tasks := make(chan *uploadTask, maxSessionsPerContext)
 	errors := make(chan error)
 	for i := 0; i < numUploaders; i++ {
 		go func() {
@@ -1038,9 +1044,9 @@ func (ctx *ExecContext) Close() {
 func (ctx *ExecContext) Uname() string {
 	ctx.lock()
 	defer ctx.unlock()
-	err := ctx.assertConnected()
+	err := ctx.assertHasConnected()
 	if err != nil {
-		panic(err)
+		ctx.logger.Bail(err)
 	}
 	return ctx.uname
 }
