@@ -312,8 +312,11 @@ func (ctx *ExecContext) MakeSession() (Session, error) {
 		ctx.lock()
 	}
 	session, err := ctx.makeSession()
+	if err != nil {
+		return nil, err
+	}
 	ctx.sessions = append(ctx.sessions, session)
-	return session, err
+	return session, nil
 }
 
 func (ctx *ExecContext) CloseSession(session Session) {
