@@ -18,7 +18,7 @@ import (
 )
 
 const maxSessionsPerContext = 5
-const networkTimeout = 10 * time.Second
+const networkTimeout = 15 * time.Second
 
 type ExecContext struct {
 	mutex    sync.Mutex
@@ -26,9 +26,10 @@ type ExecContext struct {
 	hostname string
 	port     int
 
-	sshClient    *ssh.Client
-	hasConnected bool
-	isConnected  bool
+	sshClient      *ssh.Client
+	hasConnected   bool
+	isConnected    bool
+	isReconnecting bool
 
 	sessions   []Session
 	numWaiting int
@@ -110,26 +111,35 @@ func (ctx *ExecContext) close() {
 
 func (ctx *ExecContext) reconnect() (err error) {
 	if ctx.hostname != "" {
+		ctx.isReconnecting = true
+		username := ctx.username
+		addr := fmt.Sprintf("%s:%d", ctx.hostname, ctx.port)
+		ctx.unlock()
 		agentConn, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
 		if err != nil {
+			ctx.lock()
+			ctx.isReconnecting = false
 			return err
 		}
 		defer agentConn.Close()
 		ag := agent.NewClient(agentConn)
 		auths := []ssh.AuthMethod{ssh.PublicKeysCallback(ag.Signers)}
 		config := &ssh.ClientConfig{
-			User: ctx.username,
+			User: username,
 			Auth: auths,
 		}
-		addr := fmt.Sprintf("%s:%d", ctx.hostname, ctx.port)
 		conn, err := net.DialTimeout("tcp", addr, networkTimeout)
 		if err != nil {
+			ctx.lock()
+			ctx.isReconnecting = false
 			return err
 		}
 
 		timeoutConn := &Conn{conn, networkTimeout, networkTimeout}
 		c, chans, reqs, err := ssh.NewClientConn(timeoutConn, addr, config)
 		if err != nil {
+			ctx.lock()
+			ctx.isReconnecting = false
 			return err
 		}
 		client := ssh.NewClient(c, chans, reqs)
@@ -151,6 +161,8 @@ func (ctx *ExecContext) reconnect() (err error) {
 				}
 			}
 		}()
+		ctx.lock()
+		ctx.isReconnecting = false
 		ctx.sshClient = client
 	}
 	ctx.isConnected = true
@@ -182,6 +194,10 @@ func scanNullLines(data []byte, atEOF bool) (advance int, token []byte, err erro
 
 func (ctx *ExecContext) Connect() (err error) {
 	ctx.lock()
+	if ctx.isReconnecting {
+		ctx.unlock()
+		return errors.New("Another Connect call is in progress")
+	}
 	ctx.close()
 	err = ctx.reconnect()
 	if err != nil {
