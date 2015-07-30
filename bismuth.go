@@ -14,6 +14,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 )
 
 const maxSessions = 5
@@ -24,8 +25,9 @@ type ExecContext struct {
 	hostname string
 	port     int
 
-	sshClient *ssh.Client
-	connected bool
+	sshClient    *ssh.Client
+	hasConnected bool
+	isConnected  bool
 
 	sessions   []Session
 	numWaiting int
@@ -69,20 +71,76 @@ func NewExecContext() *ExecContext {
 func (ctx *ExecContext) lock()   { ctx.mutex.Lock() }
 func (ctx *ExecContext) unlock() { ctx.mutex.Unlock() }
 
-func (ctx *ExecContext) close() {
-	if ctx.sshClient != nil {
-		ctx.sshClient.Close()
-		ctx.sshClient = nil
-	}
+// From http://stackoverflow.com/questions/31554196/ssh-connection-timeout
+
+// Conn wraps a net.Conn, and sets a deadline for every read
+// and write operation.
+type Conn struct {
+	net.Conn
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
 }
 
-func (ctx *ExecContext) connect() error {
-	ctx.lock()
-	defer ctx.unlock()
-	if ctx.connected {
-		return errors.New("Already connected")
+func (c *Conn) Read(b []byte) (int, error) {
+	err := c.Conn.SetReadDeadline(time.Now().Add(c.ReadTimeout))
+	if err != nil {
+		return 0, err
 	}
+	return c.Conn.Read(b)
+}
+
+func (c *Conn) Write(b []byte) (int, error) {
+	err := c.Conn.SetWriteDeadline(time.Now().Add(c.WriteTimeout))
+	if err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(b)
+}
+
+func SshDialTimeout(network, addr string, config *ssh.ClientConfig, timeout time.Duration) (*ssh.Client, error) {
+	conn, err := net.DialTimeout(network, addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	timeoutConn := &Conn{conn, timeout, timeout}
+	c, chans, reqs, err := ssh.NewClientConn(timeoutConn, addr, config)
+	if err != nil {
+		return nil, err
+	}
+	client := ssh.NewClient(c, chans, reqs)
+
+	// this sends keepalive packets every 2 seconds
+	// there's no useful response from these, so we can just abort if there's an error
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			<-t.C
+			_, _, err := client.Conn.SendRequest("keepalive@golang.org", true, nil)
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return client, nil
+}
+
+func (ctx *ExecContext) close() {
+	if ctx.sshClient != nil {
+		ctx.logger.Printf("Closing previous connection...\n")
+		ctx.sshClient.Close()
+		ctx.logger.Printf("Previous connection closed.\n")
+		ctx.sshClient = nil
+	}
+	ctx.isConnected = false
+}
+
+const sshTimeout = 4 * time.Second
+
+func (ctx *ExecContext) reconnect() (err error) {
 	if ctx.hostname != "" {
+		ctx.logger.Printf("Connecting to SSH_AUTH_SOCK...\n")
 		agentConn, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
 		if err != nil {
 			return err
@@ -94,12 +152,15 @@ func (ctx *ExecContext) connect() error {
 			User: ctx.username,
 			Auth: auths,
 		}
-		ctx.sshClient, err = ssh.Dial("tcp", fmt.Sprintf("%s:%d", ctx.hostname, ctx.port), config)
+		ctx.logger.Printf("Dialing...\n")
+		ctx.sshClient, err = SshDialTimeout("tcp", fmt.Sprintf("%s:%d", ctx.hostname, ctx.port), config, sshTimeout)
 		if err != nil {
+			ctx.logger.Printf("Got weird dial tone.\n")
 			return err
 		}
+		ctx.logger.Printf("Connected.\n")
 	}
-	ctx.connected = true
+	ctx.isConnected = true
 	return nil
 }
 
@@ -126,11 +187,21 @@ func scanNullLines(data []byte, atEOF bool) (advance int, token []byte, err erro
 	return 0, nil, nil
 }
 
-func (ctx *ExecContext) Connect() error {
-	err := ctx.connect()
+func (ctx *ExecContext) Connect() (err error) {
+	ctx.lock()
+	ctx.close()
+	err = ctx.reconnect()
 	if err != nil {
+		ctx.unlock()
 		return err
 	}
+
+	if ctx.hasConnected {
+		ctx.unlock()
+		return nil
+	}
+	ctx.hasConnected = true
+	ctx.unlock()
 
 	done := make(chan error)
 	numTasks := 0
@@ -186,7 +257,7 @@ func (ctx *ExecContext) Connect() error {
 }
 
 func (ctx *ExecContext) assertConnected() error {
-	if !ctx.connected {
+	if !ctx.hasConnected {
 		return errors.New("Not connected. Call Connect first.")
 	}
 	return nil
@@ -249,6 +320,8 @@ func (ctx *ExecContext) CloseSession(session Session) {
 	ctx.unlock()
 }
 
+const killTimeout = 3 * time.Second
+
 func (ctx *ExecContext) KillAllSessions() (err error) {
 	ctx.lock()
 	sessions := ctx.sessions
@@ -265,7 +338,13 @@ func (ctx *ExecContext) KillAllSessions() (err error) {
 		}
 	}
 	for _, _ = range sessions {
-		<-done
+		select {
+		case <-done:
+			break
+		case <-time.After(killTimeout):
+			ctx.Logger().Printf("@(error:Timed out waiting for a process to close.)\n")
+			break
+		}
 	}
 	return nil
 }
@@ -339,41 +418,41 @@ func (ctx *ExecContext) Logger() *log.Logger {
 	return ctx.logger
 }
 
-func (ctx ExecContext) ReverseTunnel(srcAddr string, destAddr string) (err error) {
-	// TODO:
-	// - Return something to the caller that can be used to terminate listening.
+func (ctx ExecContext) ReverseTunnel(srcAddr string, destAddr string) (listener net.Listener, errChan chan error, err error) {
 	ctx.lock()
 	defer ctx.unlock()
 	if ctx.hostname == "" {
-		return errors.New("ReverseTunnel not supported for local ExecContext")
+		return nil, nil, errors.New("ReverseTunnel not supported for local ExecContext")
 	}
-	listener, err := ctx.sshClient.Listen("tcp", srcAddr)
+	listener, err = ctx.sshClient.Listen("tcp", srcAddr)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
+	errChan = make(chan error)
 	go func() {
 		for {
 			client, err := listener.Accept()
-			if err == io.EOF {
-				ctx.logger.Printf("@(dim:Encountered EOF on reverse tunnel from) %s @(dim:to) %s\n", srcAddr, destAddr)
-				return
-			}
 			if err != nil {
-				ctx.logger.Bail(err)
+				closeErr := listener.Close()
+				if closeErr != nil {
+					ctx.Logger().Printf("@(error:Error closing reverse tunnel listener: %v)\n", closeErr)
+				}
+				errChan <- err
+				return
 			}
 			go func() {
 				defer client.Close()
 				// Establish connection with remote server
 				remote, err := net.Dial("tcp", destAddr)
 				if err != nil {
-					ctx.logger.Bail(err)
+					ctx.Logger().Printf("@(error:Error on reverse-tunnel dial: %v)\n", err)
 				}
 				chDone := make(chan bool)
 				// Start remote -> local data transfer
 				go func() {
 					_, err := io.Copy(client, remote)
 					if err != nil {
-						ctx.logger.Println("error while copy remote->local:", err)
+						ctx.Logger().Printf("@(error:Error on reverse-tunnel client->remote copy: %v)\n", err)
 					}
 					chDone <- true
 				}()
@@ -381,7 +460,7 @@ func (ctx ExecContext) ReverseTunnel(srcAddr string, destAddr string) (err error
 				go func() {
 					_, err := io.Copy(remote, client)
 					if err != nil {
-						ctx.logger.Println(err)
+						ctx.Logger().Printf("@(error:Error on reverse-tunnel remote->client copy: %v)\n", err)
 					}
 					chDone <- true
 				}()
@@ -390,7 +469,7 @@ func (ctx ExecContext) ReverseTunnel(srcAddr string, destAddr string) (err error
 			}()
 		}
 	}()
-	return nil
+	return listener, errChan, nil
 }
 
 func (ctx *ExecContext) StartCmd(session Session) (pid int, retCodeChan chan int, err error) {
