@@ -361,7 +361,7 @@ func (ctx *ExecContext) KillAllSessions() {
 		session.OnClose(sessionClosedChan)
 		pid := session.Pid()
 		if pid > 0 {
-			err := ctx.Quote("kill", "kill", fmt.Sprintf("%d", pid))
+			_, err := ctx.Quote("kill", "kill", fmt.Sprintf("%d", pid))
 			if err != nil {
 				status.Printf("Failed to kill process %d: %v\n", pid, err)
 			}
@@ -710,9 +710,9 @@ func (ctx *ExecContext) QuoteDaemonCwd(suffix string, cwd string, args ...string
 	return ctx.StartSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix))
 }
 
-func (ctx *ExecContext) Quote(suffix string, args ...string) (err error) {
-	_, err = ctx.ExecSession(SessionArgs(args...), ctx.SessionQuote(suffix))
-	return err
+func (ctx *ExecContext) Quote(suffix string, args ...string) (retCode int, err error) {
+	retCode, err = ctx.ExecSession(SessionArgs(args...), ctx.SessionQuote(suffix))
+	return retCode, err
 }
 
 func (ctx *ExecContext) RunShell(s string) (stdout []byte, stderr []byte, retCode int, err error) {
