@@ -23,8 +23,8 @@ type Session interface {
 	StdinPipe() (io.WriteCloser, error)
 	StdoutPipe() (io.Reader, error)
 	SetStdin(reader io.Reader)
-	SetStdout(writer io.WriteCloser)
-	SetStderr(writer io.WriteCloser)
+	SetStdout(writer io.Writer)
+	SetStderr(writer io.Writer)
 	Pid() int
 }
 
@@ -112,22 +112,18 @@ func NewSshSession(_session *ssh.Session) *SshSession {
 	s.onCloses = make(chan chan bool, 5)
 	return s
 }
-func (s *SshSession) SetStdin(reader io.Reader)       { s.Stdin = reader }
-func (s *SshSession) SetStdout(writer io.WriteCloser) { s.Stdout = writer }
-func (s *SshSession) SetStderr(writer io.WriteCloser) { s.Stderr = writer }
-func (s *SshSession) SetCwd(cwd string)               { s.cwd = cwd }
-func (s *SshSession) getFullCmdShell() string         { return getShellCommand(s.cwd, s.shellCmd, true) }
-func (s *SshSession) GetFullCmdShell() string         { return getShellCommand(s.cwd, s.shellCmd, false) }
-func (s *SshSession) SetCmdShell(cmd string)          { s.shellCmd = cmd }
-func (s *SshSession) SetCmdArgs(args ...string)       { s.SetCmdShell(shellquote.Join(args...)) }
+func (s *SshSession) SetStdin(reader io.Reader)  { s.Stdin = reader }
+func (s *SshSession) SetStdout(writer io.Writer) { s.Stdout = writer }
+func (s *SshSession) SetStderr(writer io.Writer) { s.Stderr = writer }
+func (s *SshSession) SetCwd(cwd string)          { s.cwd = cwd }
+func (s *SshSession) getFullCmdShell() string    { return getShellCommand(s.cwd, s.shellCmd, true) }
+func (s *SshSession) GetFullCmdShell() string    { return getShellCommand(s.cwd, s.shellCmd, false) }
+func (s *SshSession) SetCmdShell(cmd string)     { s.shellCmd = cmd }
+func (s *SshSession) SetCmdArgs(args ...string)  { s.SetCmdShell(shellquote.Join(args...)) }
 func (s *SshSession) Start() (pid int, err error) {
 	pidChan := make(chan string, 1)
 	s.retCodeChan = make(chan string, 1)
-	var tmp io.WriteCloser
-	if s.Stderr != nil {
-		tmp = NewPseudoCloser(s.Stderr)
-	}
-	s.Stderr = NewFilteredWriter(tmp, pidChan, s.retCodeChan)
+	s.Stderr = NewFilteredWriter(s.Stderr, pidChan, s.retCodeChan)
 	err = s.Session.Start(getWrappedShellCommand(s.getFullCmdShell()))
 	if err != nil {
 		return -1, err
@@ -174,22 +170,18 @@ func NewLocalSession() *LocalSession {
 	s.onCloses = make(chan chan bool, 5)
 	return s
 }
-func (s *LocalSession) SetStdin(reader io.Reader)       { s.Stdin = reader }
-func (s *LocalSession) SetStdout(writer io.WriteCloser) { s.Stdout = writer }
-func (s *LocalSession) SetStderr(writer io.WriteCloser) { s.Stderr = writer }
-func (s *LocalSession) SetCwd(cwd string)               { s.cwd = cwd }
-func (s *LocalSession) getFullCmdShell() string         { return getShellCommand(s.cwd, s.shellCmd, true) }
-func (s *LocalSession) GetFullCmdShell() string         { return getShellCommand(s.cwd, s.shellCmd, false) }
-func (s *LocalSession) SetCmdShell(cmd string)          { s.shellCmd = cmd }
-func (s *LocalSession) SetCmdArgs(args ...string)       { s.SetCmdShell(shellquote.Join(args...)) }
+func (s *LocalSession) SetStdin(reader io.Reader)  { s.Stdin = reader }
+func (s *LocalSession) SetStdout(writer io.Writer) { s.Stdout = writer }
+func (s *LocalSession) SetStderr(writer io.Writer) { s.Stderr = writer }
+func (s *LocalSession) SetCwd(cwd string)          { s.cwd = cwd }
+func (s *LocalSession) getFullCmdShell() string    { return getShellCommand(s.cwd, s.shellCmd, true) }
+func (s *LocalSession) GetFullCmdShell() string    { return getShellCommand(s.cwd, s.shellCmd, false) }
+func (s *LocalSession) SetCmdShell(cmd string)     { s.shellCmd = cmd }
+func (s *LocalSession) SetCmdArgs(args ...string)  { s.SetCmdShell(shellquote.Join(args...)) }
 func (s *LocalSession) Start() (pid int, err error) {
 	pidChan := make(chan string, 1)
 	s.retCodeChan = make(chan string, 1)
-	var tmp io.WriteCloser
-	if s.Stderr != nil {
-		tmp = NewPseudoCloser(s.Stderr)
-	}
-	s.Stderr = NewFilteredWriter(tmp, pidChan, s.retCodeChan)
+	s.Stderr = NewFilteredWriter(s.Stderr, pidChan, s.retCodeChan)
 	s.Args = []string{"sh", "-c", getWrappedShellCommand(s.getFullCmdShell())}
 	err = s.Cmd.Start()
 	if err != nil {
