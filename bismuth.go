@@ -672,12 +672,12 @@ func SessionInteractive() SessionSetupFn {
 	}
 }
 
-func (ctx *ExecContext) QuotePipeOut(suffix string, stdout io.WriteCloser, cwd string, args ...string) (err error) {
+func (ctx *ExecContext) QuoteCwdPipeOut(suffix string, cwd string, stdout io.WriteCloser, args ...string) (err error) {
 	_, err = ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdout(stdout), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
 	return err
 }
 
-func (ctx *ExecContext) QuotePipeIn(suffix string, chanStdin chan io.WriteCloser, cwd string, args ...string) (err error) {
+func (ctx *ExecContext) QuoteCwdPipeIn(suffix string, cwd string, chanStdin chan io.WriteCloser, args ...string) (err error) {
 	_, err = ctx.ExecSession(SessionPipeStdin(chanStdin), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix))
 	return err
 }
@@ -802,7 +802,7 @@ func (ctx *ExecContext) uploadRecursiveTar(srcRootPath string, destContext *Exec
 			return
 		}
 		untarArgs := []string{"tar", "xzf", "-", "-m"}
-		err := destContext.QuotePipeIn("untar", stdinChan, destRootPath, untarArgs...)
+		err := destContext.QuoteCwdPipeIn("untar", destRootPath, stdinChan, untarArgs...)
 		chanErr <- err
 	}()
 	ctxStdin := <-stdinChan
@@ -811,7 +811,7 @@ func (ctx *ExecContext) uploadRecursiveTar(srcRootPath string, destContext *Exec
 		tarArgs = append(tarArgs, "--exclude="+exclude)
 	}
 	tarArgs = append(tarArgs, "./")
-	err = ctx.QuotePipeOut("tar", ctxStdin, srcRootPath, tarArgs...)
+	err = ctx.QuoteCwdPipeOut("tar", srcRootPath, ctxStdin, tarArgs...)
 	if err != nil {
 		return err
 	}
