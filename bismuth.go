@@ -571,14 +571,22 @@ func (ctx *ExecContext) ExecSession(setupFns ...SessionSetupFn) (retCode int, er
 	return retCode, err
 }
 
-func (ctx *ExecContext) SessionQuote(suffix string) SessionSetupFn {
+func (ctx *ExecContext) SessionQuoteOut(suffix string) SessionSetupFn {
 	fn := func(session Session, ready chan error, done chan bool) {
-		stdout := ctx.newLogger(suffix)
-		stderr := ctx.newLogger(suffix)
-		defer stdout.Close()
-		defer stderr.Close()
-		session.SetStdout(stdout)
-		session.SetStderr(stderr)
+		logger := ctx.newLogger(suffix)
+		defer logger.Close()
+		session.SetStdout(logger)
+		ready <- nil
+		<-done
+	}
+	return fn
+}
+
+func (ctx *ExecContext) SessionQuoteErr(suffix string) SessionSetupFn {
+	fn := func(session Session, ready chan error, done chan bool) {
+		logger := ctx.newLogger(suffix)
+		defer logger.Close()
+		session.SetStderr(logger)
 		ready <- nil
 		<-done
 	}
@@ -633,10 +641,15 @@ func SessionBuffer() (SessionSetupFn, chan []byte) {
 	return fn, bufChan
 }
 
-func SessionPipeStdout(stdout io.Writer) SessionSetupFn {
+func SessionPipeStdout(chanStdout chan io.Reader) SessionSetupFn {
 	return func(session Session, ready chan error, done chan bool) {
-		session.SetStdout(stdout)
+		stdout, err := session.StdoutPipe()
+		if err != nil {
+			ready <- err
+			return
+		}
 		ready <- nil
+		chanStdout <- stdout
 		<-done
 	}
 }
@@ -648,8 +661,8 @@ func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
 			ready <- err
 			return
 		}
-		chanStdin <- stdin
 		ready <- nil
+		chanStdin <- stdin
 		<-done
 	}
 }
@@ -672,16 +685,16 @@ func SessionInteractive() SessionSetupFn {
 	}
 }
 
-func (ctx *ExecContext) QuoteCwdPipeOut(suffix string, cwd string, stdout io.Writer, args ...string) (retCode int, err error) {
-	return ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdout(stdout), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
+func (ctx *ExecContext) QuoteCwdPipeOut(suffix string, cwd string, chanStdout chan io.Reader, args ...string) (retCode int, err error) {
+	return ctx.ExecSession(ctx.SessionQuoteErr(suffix), SessionPipeStdout(chanStdout), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
 }
 
 func (ctx *ExecContext) QuoteCwdPipeIn(suffix string, cwd string, chanStdin chan io.WriteCloser, args ...string) (retCode int, err error) {
-	return ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdin(chanStdin), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
+	return ctx.ExecSession(ctx.SessionQuoteOut(suffix), ctx.SessionQuoteErr(suffix), SessionPipeStdin(chanStdin), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
 }
 
-func (ctx *ExecContext) QuoteCwdPipeInOut(suffix string, cwd string, chanStdin chan io.WriteCloser, stdout io.Writer, args ...string) (retCode int, err error) {
-	return ctx.ExecSession(ctx.SessionQuote(suffix), SessionPipeStdin(chanStdin), SessionPipeStdout(stdout), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
+func (ctx *ExecContext) QuoteCwdPipeInOut(suffix string, cwd string, chanStdin chan io.WriteCloser, chanStdout chan io.Reader, args ...string) (retCode int, err error) {
+	return ctx.ExecSession(ctx.SessionQuoteErr(suffix), SessionPipeStdin(chanStdin), SessionPipeStdout(chanStdout), SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...))
 }
 
 func (ctx *ExecContext) ShellInteractive(s string) (retCode int, err error) {
@@ -689,31 +702,31 @@ func (ctx *ExecContext) ShellInteractive(s string) (retCode int, err error) {
 }
 
 func (ctx *ExecContext) QuoteShell(suffix string, s string) (retCode int, err error) {
-	return ctx.ExecSession(SessionShell(s), ctx.SessionQuote(suffix))
+	return ctx.ExecSession(SessionShell(s), ctx.SessionQuoteOut(suffix), ctx.SessionQuoteErr(suffix))
 }
 
 func (ctx *ExecContext) QuoteCwdBuf(suffix string, cwd string, args ...string) (stdout []byte, stderr []byte, retCode int, err error) {
 	bufSetup, bufChan := SessionBuffer()
-	retCode, err = ctx.ExecSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), bufSetup, ctx.SessionQuote(suffix))
+	retCode, err = ctx.ExecSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), bufSetup, ctx.SessionQuoteOut(suffix), ctx.SessionQuoteErr(suffix))
 	stdout = <-bufChan
 	stderr = <-bufChan
 	return stdout, stderr, retCode, err
 }
 
 func (ctx *ExecContext) QuoteCwd(suffix string, cwd string, args ...string) (retCode int, err error) {
-	return ctx.ExecSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix))
+	return ctx.ExecSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuoteOut(suffix), ctx.SessionQuoteErr(suffix))
 }
 
-func (ctx *ExecContext) QuoteDaemonCwdPipeOut(suffix string, cwd string, stdout io.WriteCloser, args ...string) (pid int, retCodeChan chan int, err error) {
-	return ctx.StartSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix), SessionPipeStdout(stdout))
+func (ctx *ExecContext) QuoteDaemonCwdPipeOut(suffix string, cwd string, chanStdout chan io.Reader, args ...string) (pid int, retCodeChan chan int, err error) {
+	return ctx.StartSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuoteErr(suffix), SessionPipeStdout(chanStdout))
 }
 
 func (ctx *ExecContext) QuoteDaemonCwd(suffix string, cwd string, args ...string) (pid int, retCodeChan chan int, err error) {
-	return ctx.StartSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuote(suffix))
+	return ctx.StartSession(SessionCwd(ctx.AbsPath(cwd)), SessionArgs(args...), ctx.SessionQuoteOut(suffix), ctx.SessionQuoteErr(suffix))
 }
 
 func (ctx *ExecContext) Quote(suffix string, args ...string) (retCode int, err error) {
-	retCode, err = ctx.ExecSession(SessionArgs(args...), ctx.SessionQuote(suffix))
+	retCode, err = ctx.ExecSession(SessionArgs(args...), ctx.SessionQuoteOut(suffix), ctx.SessionQuoteErr(suffix))
 	return retCode, err
 }
 
@@ -813,7 +826,18 @@ func (ctx *ExecContext) uploadRecursiveTar(srcRootPath string, destContext *Exec
 		tarArgs = append(tarArgs, "--exclude="+exclude)
 	}
 	tarArgs = append(tarArgs, "./")
-	_, err = ctx.QuoteCwdPipeOut("tar", srcRootPath, ctxStdin, tarArgs...)
+	stdoutChan := make(chan io.Reader)
+	copyChan := make(chan error)
+	go func() {
+		stdout := <-stdoutChan
+		_, err := io.Copy(ctxStdin, stdout)
+		copyChan <- err
+	}()
+	_, err = ctx.QuoteCwdPipeOut("tar", srcRootPath, stdoutChan, tarArgs...)
+	if err != nil {
+		return err
+	}
+	err = <-copyChan
 	if err != nil {
 		return err
 	}
