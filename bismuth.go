@@ -35,8 +35,9 @@ type ExecContext struct {
 	numWaiting int
 	poolDone   chan bool
 
-	logger   *log.Logger
-	nameAnsi string
+	logger    *log.Logger
+	nameAnsi  string
+	logPrefix string
 
 	uname string
 	env   map[string]string
@@ -424,6 +425,12 @@ func (ctx *ExecContext) NameAnsi() string {
 	return ctx.nameAnsi
 }
 
+func (ctx *ExecContext) SetLogPrefix(prefix string) {
+	ctx.lock()
+	defer ctx.unlock()
+	ctx.logPrefix = prefix
+}
+
 func (ctx *ExecContext) newLogger(suffix string) *log.Logger {
 	logger := log.New(os.Stderr, "", 0)
 	prefix := fmt.Sprintf("@(dim)[%s] ", ctx.nameAnsi)
@@ -431,7 +438,7 @@ func (ctx *ExecContext) newLogger(suffix string) *log.Logger {
 		prefix = fmt.Sprintf("@(dim)[%s:%s] ", ctx.nameAnsi, suffix)
 	}
 	logger.EnableColorTemplate()
-	logger.SetPrefix(prefix)
+	logger.SetPrefix(ctx.logPrefix + prefix)
 	return logger
 }
 
