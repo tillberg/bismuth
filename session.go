@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -156,16 +157,13 @@ func (s *SshSession) OnClose(onClose chan bool) {
 
 type LocalSession struct {
 	*exec.Cmd
-	cwd         string
-	shellCmd    string
-	retCodeChan chan string
-	pid         int
-	onCloses    chan chan bool
+	pid      int
+	onCloses chan chan bool
 }
 
 func NewLocalSession() *LocalSession {
 	s := &LocalSession{}
-	s.Cmd = exec.Command("sh", "tbd")
+	s.Cmd = &exec.Cmd{}
 	s.Cmd.Stdin = nil
 	s.onCloses = make(chan chan bool, 5)
 	return s
@@ -173,38 +171,43 @@ func NewLocalSession() *LocalSession {
 func (s *LocalSession) SetStdin(reader io.Reader)  { s.Stdin = reader }
 func (s *LocalSession) SetStdout(writer io.Writer) { s.Stdout = writer }
 func (s *LocalSession) SetStderr(writer io.Writer) { s.Stderr = writer }
-func (s *LocalSession) SetCwd(cwd string)          { s.cwd = cwd }
-func (s *LocalSession) getFullCmdShell() string    { return getShellCommand(s.cwd, s.shellCmd, true) }
-func (s *LocalSession) GetFullCmdShell() string    { return getShellCommand(s.cwd, s.shellCmd, false) }
-func (s *LocalSession) SetCmdShell(cmd string)     { s.shellCmd = cmd }
-func (s *LocalSession) SetCmdArgs(args ...string)  { s.SetCmdShell(shellquote.Join(args...)) }
+func (s *LocalSession) SetCwd(cwd string)          { s.Dir = cwd }
+func (s *LocalSession) GetFullCmdShell() string {
+	return getShellCommand(s.Dir, shellquote.Join(s.Args...), false)
+}
+func (s *LocalSession) SetCmdShell(cmd string)    { s.Args = []string{"sh", "-c", cmd} }
+func (s *LocalSession) SetCmdArgs(args ...string) { s.Args = args }
 func (s *LocalSession) Start() (pid int, err error) {
-	pidChan := make(chan string, 1)
-	s.retCodeChan = make(chan string, 1)
-	s.Stderr = NewFilteredWriter(s.Stderr, pidChan, s.retCodeChan)
-	s.Args = []string{"sh", "-c", getWrappedShellCommand(s.getFullCmdShell())}
+	s.Path, err = exec.LookPath(s.Args[0])
+	if err != nil {
+		return -1, err
+	}
 	err = s.Cmd.Start()
 	if err != nil {
 		return -1, err
 	}
-	s.pid, err = receiveParseInt(pidChan)
-	if err == timeoutError {
-		return -1, errors.New("Timed out waiting for PID")
-	}
-	return s.pid, err
+	return s.Cmd.Process.Pid, err
 }
 func (s *LocalSession) Wait() (retCode int, err error) {
 	err = s.Cmd.Wait()
 	if err != nil {
-		return -1, err
-	}
-	retCode, err = receiveParseInt(s.retCodeChan)
-	if err == timeoutError {
-		return -1, errors.New("Timed out waiting for retCode")
+		exitError, ok := err.(*exec.ExitError)
+		if !ok {
+			return -1, err
+		}
+		waitStatus, ok := exitError.Sys().(syscall.WaitStatus)
+		if ok {
+			retCode = waitStatus.ExitStatus()
+		} else {
+			// Not really true. But it wasn't 0. TODO: Make this work in Windows
+			retCode = -1
+		}
+	} else {
+		retCode = 0
 	}
 	return retCode, err
 }
-func (s *LocalSession) Pid() (pid int) { return s.pid }
+func (s *LocalSession) Pid() (pid int) { return s.Cmd.Process.Pid }
 func (s *LocalSession) Close() error {
 	go callClosers(s.onCloses)
 	return nil
