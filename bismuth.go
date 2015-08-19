@@ -14,6 +14,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -234,14 +235,14 @@ func (ctx *ExecContext) Connect() (err error) {
 		<-unameDone
 		useNullTerminator := !ctx.IsDarwin()
 		envArgs := []string{"env"}
-		if !ctx.IsDarwin() {
+		if useNullTerminator {
 			envArgs = append(envArgs, "-0")
 		}
 		stdout, err := ctx.Output(envArgs...)
 		if err != nil {
 			done <- err
 		} else {
-			scanner := bufio.NewScanner(strings.NewReader(string(stdout)))
+			scanner := bufio.NewScanner(strings.NewReader(stdout))
 			if useNullTerminator {
 				scanner.Split(scanNullLines)
 			}
@@ -345,7 +346,7 @@ func (ctx *ExecContext) CloseSession(session Session) {
 	ctx.unlock()
 }
 
-const killTimeout = 1 * time.Second
+const killTimeout = 2 * time.Second
 
 func (ctx *ExecContext) KillAllSessions() {
 	status := ctx.Logger()
@@ -362,7 +363,12 @@ func (ctx *ExecContext) KillAllSessions() {
 		session.OnClose(sessionClosedChan)
 		pid := session.Pid()
 		if pid > 0 {
-			_, err := ctx.Quote("kill", "kill", fmt.Sprintf("%d", pid))
+			var err error
+			if ctx.IsLocal() {
+				err = syscall.Kill(pid, syscall.SIGTERM)
+			} else {
+				_, err = ctx.Quote("kill", "kill", "-SIGTERM", fmt.Sprintf("%d", pid))
+			}
 			if err != nil {
 				status.Printf("Failed to kill process %d: %v\n", pid, err)
 			}
@@ -374,6 +380,7 @@ func (ctx *ExecContext) KillAllSessions() {
 		case <-sessionClosedChan:
 			break
 		case <-timeoutChan:
+			status.Printf("@(error:Timed out in KillAllSessions while waiting for processes to exit.)\n")
 			return
 		}
 	}
@@ -1010,7 +1017,7 @@ func (ctx *ExecContext) Stat(p string) (os.FileInfo, error) {
 }
 
 func (ctx *ExecContext) PathExists(path string) (bool, error) {
-	stat, err := ctx.Stat(path)
+	stat, err := ctx.Stat(ctx.AbsPath(path))
 	if err == NotFoundError {
 		return false, nil
 	}
