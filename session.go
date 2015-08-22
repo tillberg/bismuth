@@ -164,7 +164,7 @@ type LocalSession struct {
 func NewLocalSession() *LocalSession {
 	s := &LocalSession{}
 	s.Cmd = &exec.Cmd{}
-	s.Cmd.Stdin = nil
+	s.Stdin = nil
 	s.onCloses = make(chan chan bool, 5)
 	return s
 }
@@ -207,7 +207,13 @@ func (s *LocalSession) Wait() (retCode int, err error) {
 	}
 	return retCode, err
 }
-func (s *LocalSession) Pid() (pid int) { return s.Cmd.Process.Pid }
+func (s *LocalSession) Pid() (pid int) {
+	if s.Cmd.Process != nil {
+		return s.Cmd.Process.Pid
+	} else {
+		return -1
+	}
+}
 func (s *LocalSession) Close() error {
 	go callClosers(s.onCloses)
 	return nil
