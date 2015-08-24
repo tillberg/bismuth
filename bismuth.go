@@ -551,8 +551,8 @@ func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (pid int, retCo
 	if err != nil {
 		return -1, nil, err
 	}
-	ready := make(chan error)
-	done := make(chan bool)
+	ready := make(chan error, len(setupFns))
+	done := make(chan bool, len(setupFns))
 	cleanup := func() {
 		for _, _ = range setupFns {
 			done <- true
@@ -567,7 +567,7 @@ func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (pid int, retCo
 		}
 	}
 	pid, retCodeChan2, err := ctx.StartCmd(session)
-	retCodeChan = make(chan int)
+	retCodeChan = make(chan int, 1)
 	go func() {
 		retCode := <-retCodeChan2
 		cleanup()
@@ -641,7 +641,7 @@ type BufferCloser struct {
 func (b BufferCloser) Close() error { return nil }
 
 func SessionBuffer() (SessionSetupFn, chan []byte) {
-	bufChan := make(chan []byte)
+	bufChan := make(chan []byte, 2)
 	fn := func(session Session, ready chan error, done chan bool) {
 		var bufOut BufferCloser
 		var bufErr BufferCloser
