@@ -527,6 +527,8 @@ func (ctx *ExecContext) StartCmd(session Session) (pid int, retCodeChan chan int
 	go func() {
 		defer cmdLog.Close()
 		defer ctx.CloseSession(session)
+		// XXX We need to finish reading from stdout/stderr before calling Wait:
+		// http://stackoverflow.com/questions/20134095/why-do-i-get-bad-file-descriptor-in-this-go-program-using-stderr-and-ioutil-re
 		retCode, err := session.Wait()
 		if verbose {
 			if err != nil {
