@@ -250,8 +250,12 @@ func (ctx *ExecContext) Connect() (err error) {
 				line := scanner.Text()
 				parts := strings.SplitN(line, "=", 2)
 				if len(parts) < 2 {
-					done <- errors.New(fmt.Sprintf("Could not parse env line [%s]", line))
-					return
+					// Don't bother warning about errors on Darwin, but this Scanner should be fixed for it. Somehow.
+					if useNullTerminator {
+						done <- errors.New(fmt.Sprintf("Could not parse environment line [%s]", line))
+						return
+					}
+					continue
 				}
 				ctx.env[parts[0]] = parts[1]
 			}
