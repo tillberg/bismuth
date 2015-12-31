@@ -5,9 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/tillberg/ansi-log"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 	"io"
 	"net"
 	"os"
@@ -16,6 +13,10 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	log "github.com/tillberg/ansi-log"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 const maxSessionsPerContext = 5

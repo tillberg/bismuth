@@ -3,13 +3,15 @@ package bismuth
 import (
 	"errors"
 	"fmt"
-	"github.com/kballard/go-shellquote"
-	"golang.org/x/crypto/ssh"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/kballard/go-shellquote"
+	"golang.org/x/crypto/ssh"
 )
 
 type Session interface {
@@ -166,6 +168,7 @@ func NewLocalSession() *LocalSession {
 	s.Cmd = &exec.Cmd{}
 	s.Stdin = nil
 	s.onCloses = make(chan chan bool, 5)
+	s.Env = os.Environ() // Prevent side-effects/changes to Environ?
 	return s
 }
 func (s *LocalSession) SetStdin(reader io.Reader)  { s.Stdin = reader }

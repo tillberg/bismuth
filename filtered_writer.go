@@ -3,7 +3,7 @@ package bismuth
 import (
 	"errors"
 	"io"
-	// "github.com/tillberg/ansi-log"
+	// log "github.com/tillberg/ansi-log"
 )
 
 type FilteredWriter struct {
