@@ -1076,7 +1076,13 @@ func (ctx *ExecContext) ReadFile(p string) (b []byte, err error) {
 }
 
 func (ctx *ExecContext) Symlink(dest string, src string) (err error) {
-	_, _, retCode, err := ctx.Run("ln", "-s", ctx.AbsPath(dest), ctx.AbsPath(src))
+	// We use -nf below in order to make sure that ctx.AbsPath(src) is the name of the
+	// link we create and that we overwrite any existing link already there. If we don't,
+	// and ctx.AbsPath(src) is a directory or symlink to a directory already, then we
+	// end up creating a link inside that directory, with a name taken from the basename
+	// of dest. Which is kind of confusing and probably not at all expected behavior.
+	// Alternatively, we could just fail with an error if ctx.AbsPath(src) already exists.
+	_, _, retCode, err := ctx.Run("ln", "-snf", ctx.AbsPath(dest), ctx.AbsPath(src))
 	if err != nil {
 		return err
 	}
