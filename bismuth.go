@@ -447,7 +447,7 @@ func (ctx *ExecContext) newLogger(suffix string) *log.Logger {
 	logger := log.New(os.Stderr, "", 0)
 	prefix := fmt.Sprintf("@(dim){isodate} [%s] ", ctx.nameAnsi)
 	if len(suffix) > 0 {
-		prefix = fmt.Sprintf("@(dim){isodate} [%s:%s] ", ctx.nameAnsi, suffix)
+		prefix = fmt.Sprintf("@(dim){isodate} [%s@(dim):%s] ", ctx.nameAnsi, suffix)
 	}
 	logger.EnableColorTemplate()
 	logger.SetPrefix(ctx.logPrefix + prefix)
