@@ -25,9 +25,10 @@ type Session interface {
 	Wait() (retCode int, err error)
 	StdinPipe() (io.WriteCloser, error)
 	StdoutPipe() (io.Reader, error)
+	StderrPipe() (io.Reader, error)
 	SetStdin(reader io.Reader)
-	SetStdout(writer io.Writer)
-	SetStderr(writer io.Writer)
+	// SetStdout(writer io.Writer)
+	// SetStderr(writer io.Writer)
 	Pid() int
 }
 
@@ -115,14 +116,16 @@ func NewSshSession(_session *ssh.Session) *SshSession {
 	s.onCloses = make(chan chan bool, 5)
 	return s
 }
-func (s *SshSession) SetStdin(reader io.Reader)  { s.Stdin = reader }
-func (s *SshSession) SetStdout(writer io.Writer) { s.Stdout = writer }
-func (s *SshSession) SetStderr(writer io.Writer) { s.Stderr = writer }
-func (s *SshSession) SetCwd(cwd string)          { s.cwd = cwd }
-func (s *SshSession) getFullCmdShell() string    { return getShellCommand(s.cwd, s.shellCmd, true) }
-func (s *SshSession) GetFullCmdShell() string    { return getShellCommand(s.cwd, s.shellCmd, false) }
-func (s *SshSession) SetCmdShell(cmd string)     { s.shellCmd = cmd }
-func (s *SshSession) SetCmdArgs(args ...string)  { s.SetCmdShell(shellquote.Join(args...)) }
+
+func (s *SshSession) SetStdin(reader io.Reader) { s.Stdin = reader }
+
+// func (s *SshSession) SetStdout(writer io.Writer) { s.Stdout = writer }
+// func (s *SshSession) SetStderr(writer io.Writer) { s.Stderr = writer }
+func (s *SshSession) SetCwd(cwd string)         { s.cwd = cwd }
+func (s *SshSession) getFullCmdShell() string   { return getShellCommand(s.cwd, s.shellCmd, true) }
+func (s *SshSession) GetFullCmdShell() string   { return getShellCommand(s.cwd, s.shellCmd, false) }
+func (s *SshSession) SetCmdShell(cmd string)    { s.shellCmd = cmd }
+func (s *SshSession) SetCmdArgs(args ...string) { s.SetCmdShell(shellquote.Join(args...)) }
 func (s *SshSession) Start() (pid int, err error) {
 	pidChan := make(chan string, 1)
 	s.retCodeChan = make(chan string, 1)
@@ -171,15 +174,21 @@ func NewLocalSession() *LocalSession {
 	s.Env = os.Environ() // Prevent side-effects/changes to Environ?
 	return s
 }
-func (s *LocalSession) SetStdin(reader io.Reader)  { s.Stdin = reader }
-func (s *LocalSession) SetStdout(writer io.Writer) { s.Stdout = writer }
-func (s *LocalSession) SetStderr(writer io.Writer) { s.Stderr = writer }
-func (s *LocalSession) SetCwd(cwd string)          { s.Dir = cwd }
+
+func (s *LocalSession) SetStdin(reader io.Reader) { s.Stdin = reader }
+
+// func (s *LocalSession) SetStdout(writer io.Writer) { s.Stdout = writer }
+// func (s *LocalSession) SetStderr(writer io.Writer) { s.Stderr = writer }
+func (s *LocalSession) SetCwd(cwd string) { s.Dir = cwd }
 func (s *LocalSession) GetFullCmdShell() string {
 	return getShellCommand(s.Dir, shellquote.Join(s.Args...), false)
 }
 func (s *LocalSession) SetCmdShell(cmd string)    { s.Args = []string{"sh", "-c", cmd} }
 func (s *LocalSession) SetCmdArgs(args ...string) { s.Args = args }
+func (s *LocalSession) StderrPipe() (io.Reader, error) {
+	r, err := s.Cmd.StderrPipe()
+	return r, err
+}
 func (s *LocalSession) Start() (pid int, err error) {
 	s.Path, err = exec.LookPath(s.Args[0])
 	if err != nil {
@@ -225,10 +234,6 @@ func (s *LocalSession) OnClose(onClose chan bool) {
 	s.onCloses <- onClose
 }
 func (s *LocalSession) StdoutPipe() (io.Reader, error) {
-	readCloser, err := s.Cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	reader := readCloser.(io.Reader)
-	return reader, nil
+	r, err := s.Cmd.StdoutPipe()
+	return r, err
 }

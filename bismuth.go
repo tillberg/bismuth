@@ -516,7 +516,7 @@ func (ctx ExecContext) ReverseTunnel(srcAddr string, destAddr string) (listener 
 	return listener, errChan, nil
 }
 
-func (ctx *ExecContext) StartCmd(session Session) (pid int, retCodeChan chan int, err error) {
+func (ctx *ExecContext) StartCmd(session Session, hasExited chan bool) (pid int, retCodeChan chan int, err error) {
 	cmdLog := ctx.newLogger("")
 	if verbose {
 		cmdLog.Printf("@(dim:$) %s", session.GetFullCmdShell())
@@ -532,8 +532,9 @@ func (ctx *ExecContext) StartCmd(session Session) (pid int, retCodeChan chan int
 	go func() {
 		defer cmdLog.Close()
 		defer ctx.CloseSession(session)
-		// XXX We need to finish reading from stdout/stderr before calling Wait:
+		// We need to finish reading from stdout/stderr before calling Wait:
 		// http://stackoverflow.com/questions/20134095/why-do-i-get-bad-file-descriptor-in-this-go-program-using-stderr-and-ioutil-re
+		<-hasExited
 		retCode, err := session.Wait()
 		if verbose {
 			if err != nil {
@@ -551,7 +552,7 @@ func (ctx *ExecContext) StartCmd(session Session) (pid int, retCodeChan chan int
 	return pid, retCodeChan, err
 }
 
-type SessionSetupFn func(session Session, ready chan error, done chan bool)
+type SessionSetupFn func(session Session, ready chan error) error
 
 func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (pid int, retCodeChan chan int, err error) {
 	session, err := ctx.MakeSession()
@@ -559,25 +560,26 @@ func (ctx *ExecContext) StartSession(setupFns ...SessionSetupFn) (pid int, retCo
 		return -1, nil, err
 	}
 	ready := make(chan error, len(setupFns))
-	done := make(chan bool, len(setupFns))
-	cleanup := func() {
-		for _, _ = range setupFns {
-			done <- true
-		}
-	}
 	for _, setupFn := range setupFns {
-		go setupFn(session, ready, done)
-		err = <-ready
-		if err != nil {
-			cleanup()
-			return -1, nil, err
+		_err := setupFn(session, ready)
+		if _err != nil {
+			err = _err
 		}
 	}
-	pid, retCodeChan2, err := ctx.StartCmd(session)
+	if err != nil {
+		return -1, nil, err
+	}
+	hasExited := make(chan bool)
+	go func() {
+		for range setupFns {
+			<-ready
+		}
+		hasExited <- true
+	}()
+	pid, retCodeChan2, err := ctx.StartCmd(session, hasExited)
 	retCodeChan = make(chan int, 1)
 	go func() {
 		retCode := <-retCodeChan2
-		cleanup()
 		retCodeChan <- retCode
 	}()
 	return pid, retCodeChan, err
@@ -593,50 +595,81 @@ func (ctx *ExecContext) ExecSession(setupFns ...SessionSetupFn) (retCode int, er
 }
 
 func (ctx *ExecContext) SessionQuoteOut(suffix string) SessionSetupFn {
-	fn := func(session Session, ready chan error, done chan bool) {
+	fn := func(session Session, ready chan error) error {
 		logger := ctx.newLogger(suffix)
-		defer logger.Close()
-		session.SetStdout(logger)
-		ready <- nil
-		<-done
+		stdout, err := session.StdoutPipe()
+		go func() {
+			defer logger.Close()
+			// log.Println("SessionQuoteErr", err)
+			if err != nil {
+				ready <- nil
+			} else {
+				// log.Println("SessionQuoteErr Copy start")
+				_, err := io.Copy(logger, stdout)
+				// log.Println("SessionQuoteErr Copy", err)
+				if err == io.EOF {
+					ready <- nil
+				} else {
+					ready <- err
+				}
+			}
+		}()
+		return err
 	}
 	return fn
 }
 
 func (ctx *ExecContext) SessionQuoteErr(suffix string) SessionSetupFn {
-	fn := func(session Session, ready chan error, done chan bool) {
+	fn := func(session Session, ready chan error) error {
 		logger := ctx.newLogger(suffix)
-		defer logger.Close()
-		session.SetStderr(logger)
-		ready <- nil
-		<-done
+		stderr, err := session.StderrPipe()
+		go func() {
+			defer logger.Close()
+			if err != nil {
+				ready <- nil
+			} else {
+				_, err := io.Copy(logger, stderr)
+				if err == io.EOF {
+					ready <- nil
+				} else {
+					ready <- err
+				}
+			}
+		}()
+		return err
 	}
 	return fn
 }
 
 func SessionShell(cmd string) SessionSetupFn {
-	fn := func(session Session, ready chan error, done chan bool) {
+	fn := func(session Session, ready chan error) error {
 		session.SetCmdShell(cmd)
-		ready <- nil
-		<-done
+		go func() {
+			ready <- nil
+		}()
+		return nil
 	}
 	return fn
 }
 
 func SessionArgs(args ...string) SessionSetupFn {
-	fn := func(session Session, ready chan error, done chan bool) {
+	fn := func(session Session, ready chan error) error {
 		session.SetCmdArgs(args...)
-		ready <- nil
-		<-done
+		go func() {
+			ready <- nil
+		}()
+		return nil
 	}
 	return fn
 }
 
 func SessionCwd(cwd string) SessionSetupFn {
-	fn := func(session Session, ready chan error, done chan bool) {
+	fn := func(session Session, ready chan error) error {
 		session.SetCwd(cwd)
-		ready <- nil
-		<-done
+		go func() {
+			ready <- nil
+		}()
+		return nil
 	}
 	return fn
 }
@@ -647,62 +680,102 @@ type BufferCloser struct {
 
 func (b BufferCloser) Close() error { return nil }
 
+func copyStdoutAndErr(session Session, stdout io.Writer, stderr io.Writer, ready chan error) error {
+	myReady := make(chan error)
+	copyStream := func(session Session, getPipe func(Session) (io.Reader, error), writer io.Writer) error {
+		reader, err := getPipe(session)
+		go func() {
+			if err != nil {
+				myReady <- nil
+			} else {
+				_, err := io.Copy(writer, reader)
+				if err == io.EOF {
+					myReady <- nil
+				} else {
+					myReady <- err
+				}
+			}
+		}()
+		return err
+	}
+	err1 := copyStream(session, Session.StdoutPipe, stdout)
+	err2 := copyStream(session, Session.StderrPipe, stderr)
+	go func() {
+		var err error
+		for i := 0; i < 2; i++ {
+			_err := <-myReady
+			if _err != nil {
+				err = _err
+			}
+		}
+		ready <- err
+	}()
+	if err1 != nil {
+		return err1
+	}
+	return err2
+}
+
 func SessionBuffer() (SessionSetupFn, chan []byte) {
 	bufChan := make(chan []byte, 2)
-	fn := func(session Session, ready chan error, done chan bool) {
+	fn := func(session Session, ready chan error) error {
 		var bufOut BufferCloser
 		var bufErr BufferCloser
-		session.SetStdout(&bufOut)
-		session.SetStderr(&bufErr)
-		ready <- nil
-		<-done
-		bufChan <- bufOut.Bytes()
-		bufChan <- bufErr.Bytes()
+		myReady := make(chan error)
+		err := copyStdoutAndErr(session, &bufOut, &bufErr, myReady)
+		go func() {
+			err := <-myReady
+			go func() {
+				bufChan <- bufOut.Bytes()
+			}()
+			go func() {
+				bufChan <- bufErr.Bytes()
+			}()
+			ready <- err
+		}()
+		return err
 	}
 	return fn, bufChan
 }
 
 func SessionPipeStdout(chanStdout chan io.Reader) SessionSetupFn {
-	return func(session Session, ready chan error, done chan bool) {
+	return func(session Session, ready chan error) error {
 		stdout, err := session.StdoutPipe()
-		if err != nil {
-			ready <- err
-			return
-		}
-		ready <- nil
-		chanStdout <- stdout
-		<-done
+		go func() {
+			chanStdout <- stdout
+			// XXX we need to catch EOFs somehow
+			ready <- nil
+		}()
+		return err
 	}
 }
 
 func SessionPipeStdin(chanStdin chan io.WriteCloser) SessionSetupFn {
-	return func(session Session, ready chan error, done chan bool) {
+	return func(session Session, ready chan error) error {
 		stdin, err := session.StdinPipe()
-		if err != nil {
-			ready <- err
-			return
-		}
-		ready <- nil
-		chanStdin <- stdin
-		<-done
+		go func() {
+			chanStdin <- stdin
+			ready <- nil
+		}()
+		return err
 	}
 }
 
 func SessionSetStdin(reader io.Reader) SessionSetupFn {
-	return func(session Session, ready chan error, done chan bool) {
+	return func(session Session, ready chan error) error {
 		session.SetStdin(reader)
-		ready <- nil
-		<-done
+		go func() {
+			ready <- nil
+		}()
+		return nil
 	}
 }
 
 func SessionInteractive() SessionSetupFn {
-	return func(session Session, ready chan error, done chan bool) {
+	return func(session Session, ready chan error) error {
 		session.SetStdin(os.Stdin)
-		session.SetStdout(os.Stdout)
-		session.SetStderr(os.Stderr)
-		ready <- nil
-		<-done
+		err := copyStdoutAndErr(session, os.Stdout, os.Stderr, ready)
+		return err
 	}
 }
 
