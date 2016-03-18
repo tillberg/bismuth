@@ -727,9 +727,9 @@ func SessionBuffer() (SessionSetupFn, chan []byte) {
 			err := <-myReady
 			go func() {
 				bufChan <- bufOut.Bytes()
-			}()
-			go func() {
-				bufChan <- bufErr.Bytes()
+				go func() {
+					bufChan <- bufErr.Bytes()
+				}()
 			}()
 			ready <- err
 		}()
