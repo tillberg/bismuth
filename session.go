@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"strconv"
@@ -27,8 +28,6 @@ type Session interface {
 	StdoutPipe() (io.Reader, error)
 	StderrPipe() (io.Reader, error)
 	SetStdin(reader io.Reader)
-	// SetStdout(writer io.Writer)
-	// SetStderr(writer io.Writer)
 	Pid() int
 }
 
@@ -105,15 +104,29 @@ type SshSession struct {
 	*ssh.Session
 	cwd         string
 	shellCmd    string
+	pidChan     chan string
 	retCodeChan chan string
 	pid         int
 	onCloses    chan chan bool
+	stderrPipe  io.Reader
+
+	// discardStderr is very kludgy. We *need* to read from stderr in order to process the PID and return code.
+	// If the client calls StderrPipe, then the client *must* read stderr until EOF. If the client does not call
+	// StderrPipe, then we do an io.Copy(ioutil.Discard, s.stderrPipe) to kludgily extract the PID and return code
+	// from the stream.
+	discardStderr bool
 }
 
 func NewSshSession(_session *ssh.Session) *SshSession {
-	s := &SshSession{}
-	s.Session = _session
-	s.onCloses = make(chan chan bool, 5)
+	s := &SshSession{
+		Session:       _session,
+		onCloses:      make(chan chan bool, 5),
+		pidChan:       make(chan string, 1),
+		retCodeChan:   make(chan string, 1),
+		discardStderr: true,
+	}
+	realStderr, _ := s.Session.StderrPipe() // Can this error?
+	s.stderrPipe = NewFilteredReader(realStderr, s.pidChan, s.retCodeChan)
 	return s
 }
 
@@ -126,15 +139,21 @@ func (s *SshSession) getFullCmdShell() string   { return getShellCommand(s.cwd, 
 func (s *SshSession) GetFullCmdShell() string   { return getShellCommand(s.cwd, s.shellCmd, false) }
 func (s *SshSession) SetCmdShell(cmd string)    { s.shellCmd = cmd }
 func (s *SshSession) SetCmdArgs(args ...string) { s.SetCmdShell(shellquote.Join(args...)) }
+func (s *SshSession) StderrPipe() (io.Reader, error) {
+	s.discardStderr = false
+	return s.stderrPipe, nil
+}
 func (s *SshSession) Start() (pid int, err error) {
-	pidChan := make(chan string, 1)
-	s.retCodeChan = make(chan string, 1)
-	s.Stderr = NewFilteredWriter(s.Stderr, pidChan, s.retCodeChan)
 	err = s.Session.Start(getWrappedShellCommand(s.getFullCmdShell()))
 	if err != nil {
 		return -1, err
 	}
-	s.pid, err = receiveParseInt(pidChan)
+	if s.discardStderr {
+		go func() {
+			io.Copy(ioutil.Discard, s.stderrPipe)
+		}()
+	}
+	s.pid, err = receiveParseInt(s.pidChan)
 	if err == timeoutError {
 		return -1, errors.New("Timed out waiting for PID")
 	}

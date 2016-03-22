@@ -14,7 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/tillberg/ansi-log"
+	"github.com/tillberg/ansi-log"
+
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -37,7 +38,7 @@ type ExecContext struct {
 	numWaiting int
 	poolDone   chan bool
 
-	logger    *log.Logger
+	logger    *alog.Logger
 	nameAnsi  string
 	logPrefix string
 
@@ -63,7 +64,7 @@ func (ctx *ExecContext) Init() {
 	ctx.env = make(map[string]string)
 
 	onceInit.Do(func() {
-		log.AddAnsiColorCode("host", 33)
+		alog.AddAnsiColorCode("host", 33)
 	})
 	ctx.logger = ctx.newLogger("")
 	ctx.updatedHostname()
@@ -443,8 +444,8 @@ func (ctx *ExecContext) SetLogPrefix(prefix string) {
 	ctx.logPrefix = prefix
 }
 
-func (ctx *ExecContext) newLogger(suffix string) *log.Logger {
-	logger := log.New(os.Stderr, "", 0)
+func (ctx *ExecContext) newLogger(suffix string) *alog.Logger {
+	logger := alog.New(os.Stderr, "", 0)
 	prefix := fmt.Sprintf("@(dim){isodate} [%s] ", ctx.nameAnsi)
 	if len(suffix) > 0 {
 		prefix = fmt.Sprintf("@(dim){isodate} [%s@(dim):%s] ", ctx.nameAnsi, suffix)
@@ -454,13 +455,13 @@ func (ctx *ExecContext) newLogger(suffix string) *log.Logger {
 	return logger
 }
 
-func (ctx *ExecContext) NewLogger(suffix string) *log.Logger {
+func (ctx *ExecContext) NewLogger(suffix string) *alog.Logger {
 	ctx.lock()
 	defer ctx.unlock()
 	return ctx.newLogger(suffix)
 }
 
-func (ctx *ExecContext) Logger() *log.Logger {
+func (ctx *ExecContext) Logger() *alog.Logger {
 	ctx.lock()
 	defer ctx.unlock()
 	return ctx.logger
@@ -600,13 +601,13 @@ func (ctx *ExecContext) SessionQuoteOut(suffix string) SessionSetupFn {
 		stdout, err := session.StdoutPipe()
 		go func() {
 			defer logger.Close()
-			// log.Println("SessionQuoteErr", err)
+			// alog.Println("SessionQuoteErr", err)
 			if err != nil {
 				ready <- nil
 			} else {
-				// log.Println("SessionQuoteErr Copy start")
+				// alog.Println("SessionQuoteErr Copy start")
 				_, err := io.Copy(logger, stdout)
-				// log.Println("SessionQuoteErr Copy", err)
+				// alog.Println("SessionQuoteErr Copy", err)
 				if err == io.EOF {
 					ready <- nil
 				} else {
@@ -1079,7 +1080,7 @@ func (ctx *ExecContext) Stat(p string) (os.FileInfo, error) {
 	}
 	p = ctx.AbsPath(p)
 	stdout, _, retCode, err := ctx.Run("stat", flagStr, formatStr, p)
-	// log.Printf("stat %s -- %s\n", p, strings.TrimSpace(string(stdout)))
+	// alog.Printf("stat %s -- %s\n", p, strings.TrimSpace(string(stdout)))
 	if err != nil {
 		return nil, err
 	}
