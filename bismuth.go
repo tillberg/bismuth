@@ -603,11 +603,11 @@ func (ctx *ExecContext) SessionQuoteOut(suffix string) SessionSetupFn {
 			defer logger.Close()
 			// alog.Println("SessionQuoteErr", err)
 			if err != nil {
-				ready <- nil
+				ready <- err
 			} else {
 				// alog.Println("SessionQuoteErr Copy start")
 				_, err := io.Copy(logger, stdout)
-				// alog.Println("SessionQuoteErr Copy", err)
+				// alog.Println("SessionQuoteErr Copy end", err)
 				if err == io.EOF {
 					ready <- nil
 				} else {
@@ -627,7 +627,7 @@ func (ctx *ExecContext) SessionQuoteErr(suffix string) SessionSetupFn {
 		go func() {
 			defer logger.Close()
 			if err != nil {
-				ready <- nil
+				ready <- err
 			} else {
 				_, err := io.Copy(logger, stderr)
 				if err == io.EOF {
@@ -687,7 +687,7 @@ func copyStdoutAndErr(session Session, stdout io.Writer, stderr io.Writer, ready
 		reader, err := getPipe(session)
 		go func() {
 			if err != nil {
-				myReady <- nil
+				myReady <- err
 			} else {
 				_, err := io.Copy(writer, reader)
 				if err == io.EOF {
