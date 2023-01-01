@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tillberg/ansi-log"
+	"github.com/tillberg/alog"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
